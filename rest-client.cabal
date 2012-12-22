@@ -1,0 +1,31 @@
+name:                rest-client
+version:             0.1.0.0
+synopsis:            RESTful API client library
+-- description:         
+homepage:            http://github.com/fpco/rest-client
+license:             BSD3
+license-file:        LICENSE
+author:              John Wiegley
+maintainer:          johnw@fpcomplete.com
+-- copyright:           
+category:            Network
+build-type:          Simple
+cabal-version:       >=1.8
+
+library
+  exposed-modules:     Network.REST.Client
+  -- other-modules:       
+  build-depends:       base             >= 4.5
+                     , aeson            >= 0.6.1.0
+                     , blaze-builder    >= 0.3.1.0
+                     , bytestring       >= 0.9
+                     , conduit          >= 0.5
+                     , failure          >= 0.2.0.1
+                     , http-conduit     >= 1.8.5.1
+                     , http-types       >= 0.7
+                     , lens             >= 3.7.1.2
+                     , network          >= 2.4.0.1
+                     , parallel         >= 3.2.0.3
+                     , text             >= 0.11
+                     , transformers     >= 0.3
+                     , shakespeare-text >= 1.0.0.5
