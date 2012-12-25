@@ -9,6 +9,7 @@ import           Data.Aeson
 import           Data.ByteString as B hiding (pack)
 import qualified Data.ByteString.Base64 as B64
 import           Data.Default ( Default(..) )
+import           Data.Maybe
 import           Data.Monoid
 import           Data.Text as T hiding (drop)
 import           Data.Text.Encoding as E
@@ -56,6 +57,9 @@ instance FromJSON Sha where
   parseJSON (Object v) = Sha <$> v .: "sha"
   parseJSON _ = mzero
 
+instance ToJSON Sha where
+  toJSON (Sha sha) = object ["sha" .= sha]
+
 gitHubWriteBlob :: Text -> Text -> Text -> ByteString -> IO (Maybe Sha)
 gitHubWriteBlob token owner repo content =
   restfulPostEx (Content content "utf-8")
@@ -101,11 +105,63 @@ gitHubReadTree :: Text -> Text -> Text -> IO (Maybe Tree)
 gitHubReadTree owner repo sha =
   restfulGet
     [st|https://api.github.com/repos/#{owner}/#{repo}/git/trees/#{sha}|]
-
+
 gitHubWriteTree :: Text -> Text -> Text -> Tree -> IO (Maybe Tree)
 gitHubWriteTree token owner repo tree =
   restfulPostEx tree
     [st|https://api.github.com/repos/#{owner}/#{repo}/git/trees|] $
+    addHeader "Authorization" ("token " <> token)
+
+data Signature = Signature { signatureDate  :: Text
+                           , signatureName  :: Text
+                           , signatureEmail :: Text } deriving Show
+
+instance FromJSON Signature where
+  parseJSON (Object v) = Signature <$> v .: "date"
+                                   <*> v .: "name"
+                                   <*> v .: "email"
+  parseJSON _ = mzero
+
+instance ToJSON Signature where
+  toJSON (Signature date name email) = object [ "date"  .= date
+                                              , "name"  .= name
+                                              , "email" .= email ]
+
+data Commit = Commit { commitSha       :: Text
+                     , commitAuthor    :: Signature
+                     , commitCommitter :: Maybe Signature
+                     , commitMessage   :: Text
+                     , commitTree      :: Sha
+                     , commitParents   :: [Sha] }
+            deriving Show
+
+instance FromJSON Commit where
+  parseJSON (Object v) = Commit <$> v .: "sha"
+                                <*> v .: "author"
+                                <*> v .:? "committer"
+                                <*> v .: "message"
+                                <*> v .: "tree"
+                                <*> v .: "parents"
+  parseJSON _ = mzero
+
+instance ToJSON Commit where
+  toJSON c = object $ [ "sha"       .= commitSha c
+                      , "author"    .= commitAuthor c
+                      , "message"   .= commitMessage c
+                      , "tree"      .= commitTree c
+                      , "parents"   .= commitParents c ] <>
+                      [ "committer" .= fromJust (commitCommitter c) |
+                        isJust (commitCommitter c) ]
+
+gitHubReadCommit :: Text -> Text -> Text -> IO (Maybe Commit)
+gitHubReadCommit owner repo sha =
+  restfulGet
+    [st|https://api.github.com/repos/#{owner}/#{repo}/git/commits/#{sha}|]
+
+gitHubWriteCommit :: Text -> Text -> Text -> Commit -> IO (Maybe Commit)
+gitHubWriteCommit token owner repo commit =
+  restfulPostEx commit
+    [st|https://api.github.com/repos/#{owner}/#{repo}/git/commits|] $
     addHeader "Authorization" ("token " <> token)
 
 main :: IO ()
@@ -128,5 +184,8 @@ main = withSocketsDo $ do
                             , treeEntrySha  = sha
                             , treeEntrySize = (-1) } ] }
   print =<< gitHubWriteTree (pack token) "fpco" "gitlib" tree
+
+  let csha = "a3f4494be204612f7bd526d65cd8db587e32c46d"
+  print =<< gitHubReadCommit "fpco" "gitlib" csha
 
 -- GitHub.hs
