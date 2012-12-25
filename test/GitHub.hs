@@ -3,17 +3,19 @@
 
 module Main where
 
-import Control.Applicative
-import Control.Monad
-import Data.Aeson
-import Data.ByteString as B ( ByteString, empty )
-import Data.Default ( Default(..) )
-import Data.Monoid
-import Data.Text hiding (drop)
-import Data.Text.Encoding as E
-import Network.REST.Client
-import Network.Socket
-import Text.Shakespeare.Text ( st )
+import           Control.Applicative
+import           Control.Monad
+import           Data.Aeson
+import           Data.ByteString as B hiding (pack)
+import qualified Data.ByteString.Base64 as B64
+import           Data.Default ( Default(..) )
+import           Data.Monoid
+import           Data.Text as T hiding (drop)
+import           Data.Text.Encoding as E
+import           Network.REST.Client
+import           Network.Socket
+import           System.Environment
+import           Text.Shakespeare.Text ( st )
 
 data Blob = Blob { blobContent  :: ByteString
                  , blobEncoding :: Text
@@ -27,10 +29,12 @@ instance FromJSON Blob where
                               <*> v .: "size"
   parseJSON _ = mzero
 
-gitHubReadBlob :: Text -> Text -> Text -> IO (Maybe Blob)
-gitHubReadBlob owner repo sha =
-  restfulGet
+gitHubReadBlob :: Text -> Text -> Text -> IO (Either String ByteString)
+gitHubReadBlob owner repo sha = do
+  blob <- restfulGet
     [st|https://api.github.com/repos/#{owner}/#{repo}/git/blobs/#{sha}|]
+  return $ maybe (Left "Blob not found") dec (blobContent <$> blob)
+  where dec = B64.decode . B.concat . B.split 10
 
 data Content = Content { contentContent  :: ByteString
                        , contentEncoding :: Text } deriving Show
@@ -58,12 +62,71 @@ gitHubWriteBlob token owner repo content =
     [st|https://api.github.com/repos/#{owner}/#{repo}/git/blobs|] $
     addHeader "Authorization" ("token " <> token)
 
+data Tree = Tree { treeSha  :: Text
+                 , treeTree :: [TreeEntry] }
+          deriving Show
+
+instance FromJSON Tree where
+  parseJSON (Object v) = Tree <$> v .: "sha"
+                              <*> v .: "tree"
+  parseJSON _ = mzero
+
+instance ToJSON Tree where
+  toJSON (Tree sha tree) = if T.null sha
+                           then object ["tree" .= tree]
+                           else object ["sha" .= sha, "tree" .= tree]
+
+data TreeEntry = TreeEntry { treeEntryType :: Text
+                           , treeEntryPath :: Text
+                           , treeEntryMode :: Text
+                           , treeEntrySize :: Int
+                           , treeEntrySha  :: Text }
+          deriving Show
+
+instance FromJSON TreeEntry where
+  parseJSON (Object v) = TreeEntry <$> v .: "type"
+                                   <*> v .: "path"
+                                   <*> v .: "mode"
+                                   <*> v .:? "size" .!= (-1)
+                                   <*> v .: "sha"
+  parseJSON _ = mzero
+
+instance ToJSON TreeEntry where
+  toJSON entry = object [ "type" .= treeEntryType entry
+                        , "path" .= treeEntryPath entry
+                        , "mode" .= treeEntryMode entry
+                        , "sha"  .= treeEntrySha entry ]
+
+gitHubReadTree :: Text -> Text -> Text -> IO (Maybe Tree)
+gitHubReadTree owner repo sha =
+  restfulGet
+    [st|https://api.github.com/repos/#{owner}/#{repo}/git/trees/#{sha}|]
+
+gitHubWriteTree :: Text -> Text -> Text -> Tree -> IO (Maybe Tree)
+gitHubWriteTree token owner repo tree =
+  restfulPostEx tree
+    [st|https://api.github.com/repos/#{owner}/#{repo}/git/trees|] $
+    addHeader "Authorization" ("token " <> token)
+
 main :: IO ()
 main = withSocketsDo $ do
-  -- print =<<
-  --   gitHubReadBlob "fpco" "gitlib" "d0047eb9166206e67bb12dbb6f1de65b89d6b68e"
-  print =<<
-    gitHubWriteBlob "_" "fpco" "gitlib"
-      (E.encodeUtf8 "Hello, world!")
+  [token] <- getArgs
+
+  let sha = "3340a84bddc2c1a945b4e1ad232f4e1d0ae2a2dc"
+  print =<< gitHubReadBlob "fpco" "gitlib" sha
+  print =<< gitHubWriteBlob (pack token) "fpco" "gitlib"
+                            (E.encodeUtf8 "Hello, world!")
+
+  print =<< gitHubReadTree "fpco" "gitlib"
+                           "d2ce27a394f9fa8ce5a83fb52405a2701feeadd3"
+  let tree =
+        Tree { treeSha = ""
+             , treeTree = [
+                  TreeEntry { treeEntryType = "blob"
+                            , treeEntryMode = "100644"
+                            , treeEntryPath = "sample"
+                            , treeEntrySha  = sha
+                            , treeEntrySize = (-1) } ] }
+  print =<< gitHubWriteTree (pack token) "fpco" "gitlib" tree
 
 -- GitHub.hs
