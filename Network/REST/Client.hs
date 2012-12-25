@@ -3,7 +3,6 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE RankNTypes #-}
 
 module Network.REST.Client where
@@ -153,7 +152,7 @@ restfulBody :: MonadRestfulInner m =>
                C.RequestBody (ResourceT m) -> RESTful ()
                -> m (ResumableSource (ResourceT m) ByteString)
 restfulBody body rest = C.withManager $ \mgr -> do
-  req <- buildRequest $ flip execState (def :: PreRequest) rest
+  req <- buildRequest $ execState rest (def :: PreRequest)
   C.responseBody <$> C.http req { C.requestBody = body } mgr
 
 restfulRawWith :: MonadRestfulInner m =>
@@ -214,7 +213,7 @@ restfulPostRaw body url = restfulUrlRaw methodPost body url (return ())
 restfulPostRawEx :: MonadRestfulOuter m =>
                     C.RequestBody (ResourceT (ResourceT m)) -> Text
                     -> RESTful () -> m (Maybe ByteString)
-restfulPostRawEx body = restfulUrlRaw methodPost body
+restfulPostRawEx = restfulUrlRaw methodPost
 
 restfulUrl :: (MonadRestfulOuter m, FromJSON a) =>
               Method -> C.RequestBody (ResourceT (ResourceT m)) -> Text
@@ -254,7 +253,6 @@ restfulPost v url =
 
 restfulPostEx :: (MonadRestfulOuter m, ToJSON a, FromJSON b) =>
                  a -> Text -> RESTful () -> m (Maybe b)
-restfulPostEx v url env =
-  restfulUrl methodPost (C.RequestBodyLBS (encode (toJSON v))) url env
+restfulPostEx v = restfulUrl methodPost (C.RequestBodyLBS (encode (toJSON v)))
 
 -- Client.hs
