@@ -9,16 +9,17 @@
 module Network.REST.Client where
 
 import           Blaze.ByteString.Builder ( toByteString )
-import           Control.Applicative ( Applicative((<*>)), (<$>) )
+import           Control.Applicative
 import           Control.Exception ( SomeException )
 import           Control.Lens ( (.=), (%=), (<&>) )
 import           Control.Monad.IO.Class
 import           Control.Monad.Trans.State.Lazy ( State, execState )
-import           Data.Aeson ( Value(Object), FromJSON(..), (.:), decode )
+import           Data.Aeson hiding ((.=))
 import           Data.Attempt
 import           Data.ByteString as B ( ByteString, empty )
 import qualified Data.ByteString.Char8 as BC ( unpack )
 import qualified Data.ByteString.Lazy as BL ( fromChunks )
+import           Data.CaseInsensitive
 import           Data.Certificate.X509 ( X509 )
 import           Data.Conduit
 import           Data.Default ( Default(..) )
@@ -26,12 +27,10 @@ import           Data.Maybe ( fromMaybe )
 import           Data.Text as T ( Text, empty, unpack, pack )
 import qualified Data.Text.Encoding as E ( encodeUtf8 )
 import           Data.Tuple ( swap )
-import           Network ( withSocketsDo )
 import qualified Network.HTTP.Conduit as C
 import           Network.HTTP.Types
 import           Network.Socks5 ( SocksConf )
 import           Network.TLS ( PrivateKey )
-import           Text.Shakespeare.Text ( st )
 
 type ContentType = ByteString
 type RequestPath = Either Text (Query,[Text])
@@ -84,6 +83,9 @@ _port :: Functor f => (Int -> f Int) -> PreRequest -> f PreRequest
 _port f req   = f (port req)   <&> \v -> req { port   = v }
 _secure :: Functor f => (Bool -> f Bool) -> PreRequest -> f PreRequest
 _secure f req = f (secure req) <&> \v -> req { secure = v }
+_headers :: Functor f =>
+            (RequestHeaders -> f RequestHeaders) -> PreRequest -> f PreRequest
+_headers f req = f (requestHeaders req) <&> \v -> req { requestHeaders = v }
 
 instance Default PreRequest where
   def = PreRequest { method             = methodGet
@@ -112,6 +114,10 @@ addDynPath = addPath . pack . show
 setUrl :: Text -> RESTful ()
 setUrl = (_path .=) . Left
 
+addHeader :: Text -> Text -> RESTful ()
+addHeader name value =
+  _headers %= (++ [(mk (E.encodeUtf8 name), E.encodeUtf8 value)])
+
 buildRequest :: Failure C.HttpException m => PreRequest -> m (C.Request m)
 buildRequest p = do
   req <- C.parseUrl (either unpack buildUrl (path p))
@@ -168,61 +174,87 @@ restfulWith reqBody rest = do
 
 restful :: (MonadRestfulInner m, FromJSON a) => RESTful () -> m (Maybe a)
 restful = restfulWith (C.RequestBodyBS B.empty)
-
+
 restfulUrlRaw :: MonadRestfulOuter m =>
                  Method -> C.RequestBody (ResourceT (ResourceT m)) -> Text
-                 -> m (Maybe ByteString)
-restfulUrlRaw meth body url =
-  runResourceT $ restfulRawWith body $ _method .= meth >> setUrl url
+                 -> RESTful () -> m (Maybe ByteString)
+restfulUrlRaw meth body url env =
+  runResourceT $ restfulRawWith body $ _method .= meth >> setUrl url >> env
 
 restfulGetRaw :: MonadRestfulOuter m => Text -> m (Maybe ByteString)
-restfulGetRaw = restfulUrlRaw methodGet (C.RequestBodyBS B.empty)
+restfulGetRaw url =
+  restfulUrlRaw methodGet (C.RequestBodyBS B.empty) url (return ())
+
+restfulGetRawEx :: MonadRestfulOuter m =>
+                   Text -> RESTful () -> m (Maybe ByteString)
+restfulGetRawEx = restfulUrlRaw methodGet (C.RequestBodyBS B.empty)
 
 restfulHeadRaw :: MonadRestfulOuter m => Text -> m (Maybe ByteString)
-restfulHeadRaw = restfulUrlRaw methodHead (C.RequestBodyBS B.empty)
+restfulHeadRaw url =
+  restfulUrlRaw methodHead (C.RequestBodyBS B.empty) url (return ())
 
-restfulPutRaw :: MonadRestfulOuter m =>
-                 C.RequestBody (ResourceT (ResourceT m)) -> Text
-                 -> m (Maybe ByteString)
-restfulPutRaw = restfulUrlRaw methodPut
+restfulHeadRawEx :: MonadRestfulOuter m =>
+                    Text -> RESTful () -> m (Maybe ByteString)
+restfulHeadRawEx = restfulUrlRaw methodHead (C.RequestBodyBS B.empty)
 
+restfulPostRawBS :: MonadRestfulOuter m =>
+                    ByteString -> Text -> m (Maybe ByteString)
+restfulPostRawBS body url =
+  restfulUrlRaw methodPost (C.RequestBodyBS body) url (return ())
+
+restfulPostRawBSEx :: MonadRestfulOuter m =>
+                      ByteString -> Text -> RESTful () -> m (Maybe ByteString)
+restfulPostRawBSEx body = restfulUrlRaw methodPost (C.RequestBodyBS body)
+
+restfulPostRaw :: MonadRestfulOuter m =>
+                  C.RequestBody (ResourceT (ResourceT m)) -> Text
+                  -> m (Maybe ByteString)
+restfulPostRaw body url = restfulUrlRaw methodPost body url (return ())
+
+restfulPostRawEx :: MonadRestfulOuter m =>
+                    C.RequestBody (ResourceT (ResourceT m)) -> Text
+                    -> RESTful () -> m (Maybe ByteString)
+restfulPostRawEx body = restfulUrlRaw methodPost body
+
 restfulUrl :: (MonadRestfulOuter m, FromJSON a) =>
               Method -> C.RequestBody (ResourceT (ResourceT m)) -> Text
-              -> m (Maybe a)
-restfulUrl meth body url =
-  runResourceT $ restfulWith body $ _method .= meth >> setUrl url
+              -> RESTful () -> m (Maybe a)
+restfulUrl meth body url env =
+  runResourceT $ restfulWith body $ _method .= meth >> setUrl url >> env
 
 restfulGet :: (MonadRestfulOuter m, FromJSON a) => Text -> m (Maybe a)
-restfulGet = restfulUrl methodGet (C.RequestBodyBS B.empty)
+restfulGet url =
+  restfulUrl methodGet (C.RequestBodyBS B.empty) url (return ())
+
+restfulGetEx :: (MonadRestfulOuter m, FromJSON a) => Text -> RESTful ()
+                -> m (Maybe a)
+restfulGetEx = restfulUrl methodGet (C.RequestBodyBS B.empty)
 
 restfulHead :: (MonadRestfulOuter m, FromJSON a) => Text -> m (Maybe a)
-restfulHead = restfulUrl methodHead (C.RequestBodyBS B.empty)
+restfulHead url =
+  restfulUrl methodHead (C.RequestBodyBS B.empty) url (return ())
 
-restfulPut :: (MonadRestfulOuter m, FromJSON a) =>
-              C.RequestBody (ResourceT (ResourceT m)) -> Text -> m (Maybe a)
-restfulPut = restfulUrl methodPut
-
-data Blob = Blob { blobContent  :: ByteString
-                 , blobEncoding :: Text
-                 , blobSha      :: Text
-                 , blobSize     :: Int }
-          deriving (Show, Eq)
+restfulHeadEx :: (MonadRestfulOuter m, FromJSON a) => Text -> RESTful ()
+                 -> m (Maybe a)
+restfulHeadEx = restfulUrl methodHead (C.RequestBodyBS B.empty)
 
-instance FromJSON Blob where
-  parseJSON (Object v) = Blob <$> v .: "content"
-                              <*> v .: "encoding"
-                              <*> v .: "sha"
-                              <*> v .: "size"
-  parseJSON _ = undefined
+restfulPostBS :: (MonadRestfulOuter m, FromJSON a) =>
+                 ByteString -> Text -> m (Maybe a)
+restfulPostBS body url =
+  restfulUrl methodPost (C.RequestBodyBS body) url (return ())
 
-gitHubBlob :: Text -> Text -> Text -> IO (Maybe Blob)
-gitHubBlob owner repo sha =
-  restfulGet
-    [st|https://api.github.com/repos/#{owner}/#{repo}/git/blobs/#{sha}|]
+restfulPostBSEx :: (MonadRestfulOuter m, FromJSON a) =>
+                 ByteString -> Text -> RESTful () -> m (Maybe a)
+restfulPostBSEx body = restfulUrl methodPost (C.RequestBodyBS body)
 
-main :: IO ()
-main = withSocketsDo $ do
-  print =<<
-    gitHubBlob "fpco" "gitlib" "d0047eb9166206e67bb12dbb6f1de65b89d6b68e"
+restfulPost :: (MonadRestfulOuter m, ToJSON a, FromJSON b) =>
+               a -> Text -> m (Maybe b)
+restfulPost v url =
+  restfulUrl methodPost (C.RequestBodyLBS (encode (toJSON v))) url (return ())
+
+restfulPostEx :: (MonadRestfulOuter m, ToJSON a, FromJSON b) =>
+                 a -> Text -> RESTful () -> m (Maybe b)
+restfulPostEx v url env =
+  restfulUrl methodPost (C.RequestBodyLBS (encode (toJSON v))) url env
 
 -- Client.hs
