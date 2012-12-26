@@ -13,6 +13,7 @@ import           Data.Maybe
 import           Data.Monoid
 import           Data.Text as T hiding (drop)
 import           Data.Text.Encoding as E
+import           Network.HTTP.Types
 import           Network.REST.Client
 import           Network.Socket
 import           System.Environment
@@ -163,6 +164,57 @@ gitHubWriteCommit token owner repo commit =
   restfulPostEx commit
     [st|https://api.github.com/repos/#{owner}/#{repo}/git/commits|] $
     addHeader "Authorization" ("token " <> token)
+
+data ObjectRef = ObjectRef { objectRefType :: Text
+                           , objectRefSha  :: Text } deriving Show
+
+instance FromJSON ObjectRef where
+  parseJSON (Object v) = ObjectRef <$> v .: "type"
+                                   <*> v .: "sha"
+  parseJSON _ = mzero
+
+instance ToJSON ObjectRef where
+  toJSON c = object $ [ "type" .= objectRefType c
+                      , "sha"  .= objectRefSha c ]
+
+data Reference = Reference { referenceRef    :: Text
+                           , referenceObject :: ObjectRef } deriving Show
+
+instance FromJSON Reference where
+  parseJSON (Object v) = Reference <$> v .: "ref"
+                                   <*> v .: "object"
+  parseJSON _ = mzero
+
+instance ToJSON Reference where
+  toJSON c = object $ [ "ref"    .= referenceRef c
+                      , "object" .= referenceObject c ]
+
+gitHubGetRef :: Text -> Text -> Text -> IO (Maybe Reference)
+gitHubGetRef owner repo ref =
+  restfulGet
+    [st|https://api.github.com/repos/#{owner}/#{repo}/git/#{ref}|]
+
+gitHubGetAllRefs :: Text -> Text -> Text -> IO (Maybe [Reference])
+gitHubGetAllRefs owner repo namespace =
+  restfulGet
+    [st|https://api.github.com/repos/#{owner}/#{repo}/git/#{namespace}|]
+
+gitHubCreateRef :: Text -> Text -> Text -> Reference -> IO (Maybe Reference)
+gitHubCreateRef token owner repo ref =
+  restfulPostEx ref
+    [st|https://api.github.com/repos/#{owner}/#{repo}/git/refs|] $
+    addHeader "Authorization" ("token " <> token)
+
+gitHubUpdateRef :: Text -> Text -> Text -> Text -> Sha -> IO (Maybe Reference)
+gitHubUpdateRef token owner repo ref sha =
+  restfulPostEx sha
+    [st|https://api.github.com/repos/#{owner}/#{repo}/git/#{ref}|] $ do
+      setMethod "PATCH"
+      addQueryParam "force" True
+      addHeader "Authorization" ("token " <> token)
+
+gitHubDeleteRef :: Text -> Text -> Text -> Text -> IO ()
+gitHubDeleteRef token owner repo ref = undefined
 
 main :: IO ()
 main = withSocketsDo $ do

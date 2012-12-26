@@ -10,9 +10,9 @@ module Network.REST.Client where
 import           Blaze.ByteString.Builder ( toByteString )
 import           Control.Applicative
 import           Control.Exception ( SomeException )
-import           Control.Lens ( (.=), (%=), (<&>) )
+import           Control.Lens
 import           Control.Monad.IO.Class
-import           Control.Monad.Trans.State.Lazy ( State, execState )
+import           Control.Monad.Trans.State.Lazy
 import           Data.Aeson hiding ((.=))
 import           Data.Attempt
 import           Data.ByteString as B ( ByteString, empty )
@@ -37,6 +37,7 @@ type RequestPath = Either Text (Query,[Text])
 data PreRequest = PreRequest
     { method :: Method                  -- HTTP request method, eg GET, POST.
     , path :: RequestPath
+    , queryString :: ByteString
     , host :: Text
     , port :: Int
     , secure :: Bool                    -- Whether to use HTTPS (ie, SSL).
@@ -76,6 +77,9 @@ _method f req = f (method req) <&> \v -> req { method = v }
 _path :: Functor f =>
          (RequestPath -> f RequestPath) -> PreRequest -> f PreRequest
 _path f req   = f (path req)   <&> \v -> req { path   = v }
+_query :: Functor f =>
+          (ByteString -> f ByteString) -> PreRequest -> f PreRequest
+_query f req   = f (queryString req) <&> \v -> req { queryString = v }
 _host :: Functor f => (Text -> f Text) -> PreRequest -> f PreRequest
 _host f req   = f (host req)   <&> \v -> req { host   = v }
 _port :: Functor f => (Int -> f Int) -> PreRequest -> f PreRequest
@@ -113,9 +117,17 @@ addDynPath = addPath . pack . show
 setUrl :: Text -> RESTful ()
 setUrl = (_path .=) . Left
 
+setMethod :: Method -> RESTful ()
+setMethod = (_method .=)
+
+addQueryParam :: Text -> Text -> RESTful ()
+addQueryParam key val = do
+  let q = (E.encodeUtf8 key,Just (E.encodeUtf8 val))
+  _path._right._1 %= (++ [q])
+
 addHeader :: Text -> Text -> RESTful ()
-addHeader name value =
-  _headers %= (++ [(mk (E.encodeUtf8 name), E.encodeUtf8 value)])
+addHeader name val =
+  _headers %= (++ [(mk (E.encodeUtf8 name), E.encodeUtf8 val)])
 
 buildRequest :: Failure C.HttpException m => PreRequest -> m (C.Request m)
 buildRequest p = do
