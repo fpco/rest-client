@@ -4,278 +4,269 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ViewPatterns #-}
 
 module Network.REST.Client where
 
-import           Blaze.ByteString.Builder ( toByteString )
+import           Blaze.ByteString.Builder ( Builder, toByteString )
 import           Control.Applicative
-import           Control.Exception ( SomeException )
 import           Control.Lens
 import           Control.Monad.IO.Class
 import           Control.Monad.Trans.State.Lazy
 import           Data.Aeson hiding ((.=))
 import           Data.Attempt
 import           Data.ByteString as B ( ByteString, empty )
-import qualified Data.ByteString.Char8 as BC ( unpack )
-import qualified Data.ByteString.Lazy as BL ( fromChunks )
+import qualified Data.ByteString.Char8 as BC
+import qualified Data.ByteString.Lazy as BL
 import           Data.CaseInsensitive
-import           Data.Certificate.X509 ( X509 )
 import           Data.Conduit
 import           Data.Default ( Default(..) )
-import           Data.Maybe ( fromMaybe )
+import           Data.Functor.Identity
+import           Data.Monoid
 import           Data.Text as T ( Text, empty, unpack, pack )
-import qualified Data.Text.Encoding as E ( encodeUtf8 )
-import           Data.Tuple ( swap )
-import qualified Network.HTTP.Conduit as C
+import qualified Data.Text.Encoding as E
+import           Network.HTTP.Conduit as C
 import           Network.HTTP.Types
-import           Network.Socks5 ( SocksConf )
-import           Network.TLS ( PrivateKey )
+import           Network.URI
 
 type ContentType = ByteString
 type RequestPath = Either Text (Query,[Text])
+type RequestId   = Request Identity
 
--- jww (2012-12-26): I could perhaps use:
---   newtype PreRequest = Request Identity
-data PreRequest = PreRequest
-    { method :: Method                  -- HTTP request method, eg GET, POST.
-    , path :: RequestPath
-    , queryString :: ByteString
-    , host :: Text
-    , port :: Int
-    , secure :: Bool                    -- Whether to use HTTPS (ie, SSL).
-    , clientCertificates :: [(X509, Maybe PrivateKey)]
-                                       -- SSL client certificates
+data RESTfulEnv = RESTfulEnv
+    { request      :: RequestId
+    , remoteUri    :: Text
+    , pathSegments :: [Text]
+    , queryParams  :: QueryText }
 
-    , proxy :: Maybe C.Proxy            -- Optional HTTP proxy.
-    , socksProxy :: Maybe SocksConf     -- Optional SOCKS proxy.
+_request :: Functor f =>
+            (RequestId -> f RequestId) -> RESTfulEnv -> f RESTfulEnv
+_request f env = f (request env) <&> \v -> env { request = v }
+_uri :: Functor f => (Text -> f Text) -> RESTfulEnv -> f RESTfulEnv
+_uri f env = f (remoteUri env) <&> \v -> env { remoteUri = v }
+_path :: Functor f => ([Text] -> f [Text]) -> RESTfulEnv -> f RESTfulEnv
+_path f env = f (pathSegments env) <&> \v -> env { pathSegments = v }
+_query :: Functor f => (QueryText -> f QueryText) -> RESTfulEnv -> f RESTfulEnv
+_query f env = f (queryParams env) <&> \v -> env { queryParams = v }
 
-    , redirectCount :: Int              -- How many redirects to follow when
-                                       -- getting a resource. 0 means follow
-                                       -- no redirects. Default value: 10.
-    , checkStatus :: Maybe (Status -> ResponseHeaders -> Maybe SomeException)
-                                       -- Check the status code. Note that
-                                       -- this will run after all redirects
-                                       -- are performed. Default: return a
-                                       -- @StatusCodeException@ on non-2XX
-                                       -- responses.
-    , responseTimeout :: Maybe Int      -- Number of microseconds to wait for a
-                                       -- response. If @Nothing@, will wait
-                                       -- indefinitely. Default: 5 seconds.
-
-    , requestHeaders :: RequestHeaders  -- Custom HTTP request headers
-
-    , rawBody :: Bool                   -- If @True@, a chunked and\/or gzipped
-                                       -- body will not be decoded. Use with
-                                       -- caution.
-    , decompress :: ContentType -> Bool  -- Predicate to specify whether gzipped
-                                       -- data should be decompressed on the
-                                       -- fly (see 'alwaysDecompress' and
-                                       -- 'browserDecompress'). Default:
-                                       -- browserDecompress.
-    }
-
-_method :: Functor f => (Method -> f Method) -> PreRequest -> f PreRequest
+_method :: Functor f => (Method -> f Method) -> RequestId -> f RequestId
 _method f req = f (method req) <&> \v -> req { method = v }
-_path :: Functor f =>
-         (RequestPath -> f RequestPath) -> PreRequest -> f PreRequest
-_path f req   = f (path req)   <&> \v -> req { path   = v }
-_query :: Functor f =>
-          (ByteString -> f ByteString) -> PreRequest -> f PreRequest
-_query f req   = f (queryString req) <&> \v -> req { queryString = v }
-_host :: Functor f => (Text -> f Text) -> PreRequest -> f PreRequest
-_host f req   = f (host req)   <&> \v -> req { host   = v }
-_port :: Functor f => (Int -> f Int) -> PreRequest -> f PreRequest
-_port f req   = f (port req)   <&> \v -> req { port   = v }
-_secure :: Functor f => (Bool -> f Bool) -> PreRequest -> f PreRequest
+_host :: Functor f => (ByteString -> f ByteString) -> RequestId -> f RequestId
+_host f req = f (host req) <&> \v -> req { host = v }
+_port :: Functor f => (Int -> f Int) -> RequestId -> f RequestId
+_port f req = f (port req) <&> \v -> req { port = v }
+_secure :: Functor f => (Bool -> f Bool) -> RequestId -> f RequestId
 _secure f req = f (secure req) <&> \v -> req { secure = v }
 _headers :: Functor f =>
-            (RequestHeaders -> f RequestHeaders) -> PreRequest -> f PreRequest
+            (RequestHeaders -> f RequestHeaders) -> RequestId -> f RequestId
 _headers f req = f (requestHeaders req) <&> \v -> req { requestHeaders = v }
 
-instance Default PreRequest where
-  def = PreRequest { method             = methodGet
-                   , path               = Right ([],[])
-                   , host               = T.empty
-                   , port               = 80
-                   , secure             = False
-                   , clientCertificates = []
-                   , proxy              = Nothing
-                   , socksProxy         = Nothing
-                   , redirectCount      = 10
-                   , checkStatus        = Nothing
-                   , responseTimeout    = Nothing
-                   , requestHeaders     = []
-                   , rawBody            = False
-                   , decompress         = C.browserDecompress }
+instance Default RESTfulEnv where
+  def = RESTfulEnv { request      = def
+                   , remoteUri    = T.empty
+                   , pathSegments = []
+                   , queryParams  = []}
 
-type RESTful a = State PreRequest a
+type RESTful a = State RESTfulEnv a
 
 addPath :: Text -> RESTful ()
-addPath segment = _path %= (((++ [segment]) <$>) <$>)
+addPath segment = _path <>= [segment]
 
 addDynPath :: (Show a) => a -> RESTful ()
 addDynPath = addPath . pack . show
 
 setUrl :: Text -> RESTful ()
-setUrl = (_path .=) . Left
+setUrl = (_uri .=)
 
 setMethod :: Method -> RESTful ()
-setMethod = (_method .=)
+setMethod = (_request._method .=)
+
+addQueryKeyword :: Text -> RESTful ()
+addQueryKeyword key = _query <>= [(key,Nothing)]
 
 addQueryParam :: Text -> Text -> RESTful ()
-addQueryParam key val = do
-  let q = (E.encodeUtf8 key,Just (E.encodeUtf8 val))
-  -- jww (2012-12-26): Promote path to a Right.  Perhaps I can just use a
-  -- special lens that views the Left as the equivalent Right.
-  _path._right._1 %= (++ [q])
+addQueryParam key val = _query <>= [(key,Just val)]
 
 addHeader :: Text -> Text -> RESTful ()
 addHeader name val =
-  _headers %= (++ [(mk (E.encodeUtf8 name), E.encodeUtf8 val)])
+  _request._headers <>= [(mk (E.encodeUtf8 name), E.encodeUtf8 val)]
 
-buildRequest :: Failure C.HttpException m => PreRequest -> m (C.Request m)
-buildRequest p = do
-  -- jww (2012-12-26): Use Network.URI to parse/decode the URI and then
-  -- recompose it using http-types
-  req <- C.parseUrl (either unpack buildUrl (path p))
-  let req' = req {
-          C.method             = method p
-        , C.clientCertificates = clientCertificates p
-        , C.proxy              = proxy p
-        , C.socksProxy         = socksProxy p
-        , C.redirectCount      = redirectCount p
-        , C.checkStatus        = fromMaybe (C.checkStatus req) (checkStatus p)
-        , C.responseTimeout    = responseTimeout p
-        , C.requestHeaders     = requestHeaders p
-        , C.rawBody            = rawBody p
-        , C.decompress         = decompress p }
+-- jww (2012-12-27): Test all of these encodings and decodings using fake
+-- Arabic URIs.
+utf8ToString :: Builder -> String
+utf8ToString = T.unpack . E.decodeUtf8 . toByteString
 
-  case path p of
-    Left _ -> return req'
-    Right _ -> return req' {
-        C.host   = E.encodeUtf8 (host p)
-      , C.port   = port p
-      , C.secure = secure p }
+getRequestUri :: Failure HttpException m => RESTfulEnv -> m URI
+getRequestUri rest@(remoteUri -> "") =
+  let req = request rest
+  in return URI {
+      uriScheme = if secure req then "https:" else "http:"
+    , uriAuthority =
+         Just URIAuth { uriUserInfo = ""
+                      , uriRegName = BC.unpack $ host req
+                      , uriPort = ':' : show (port req) }
+    , uriPath     = utf8ToString (encodePathSegments (pathSegments rest))
+    , uriQuery    = utf8ToString (renderQueryText True (queryParams rest))
+    , uriFragment = "" }
 
-  where buildUrl = BC.unpack . toByteString . uncurry encodePath . swap
+getRequestUri rest =
+  let ps  = pathSegments rest
+      qs  = queryParams rest
+      uri = parseURI (encodeUri (remoteUri rest))
+  in case uri of
+    Nothing -> failure $ InvalidUrlException (T.unpack (remoteUri rest))
+                                            "Invalid Nothing"
+    Just uri' -> return uri' {
+        uriPath =
+           if null ps
+           then uriPath uri'
+           else utf8ToString
+                (encodePathSegments
+                 (ps <> decodePathSegments (BC.pack (uriPath uri'))))
+      , uriQuery =
+           if null qs
+           then uriQuery uri'
+           else utf8ToString
+                (renderQueryText True
+                 (qs <> parseQueryText (BC.pack (uriQuery uri')))) }
+  where encodeUri = escapeURIString isAllowedInURI . unpack
+
+buildRequest :: Failure HttpException m => RESTfulEnv -> m (Request m)
+buildRequest rest = do
+  let reqi = request rest
+  uri <- getRequestUri rest
+  req <- parseUrl ((uriToString id uri) "")
+  return req {
+      method             = method reqi
+    , clientCertificates = clientCertificates reqi
+    , proxy              = proxy reqi
+    , socksProxy         = socksProxy reqi
+    , redirectCount      = redirectCount reqi
+    , checkStatus        = checkStatus reqi
+    , responseTimeout    = responseTimeout reqi
+    , requestHeaders     = requestHeaders reqi
+    , rawBody            = rawBody reqi
+    , decompress         = decompress reqi }
 
 type MonadRestfulInner m =
   -- jww (2012-12-26): MonadResource will change/move once I move withManager
   -- out the user level
-  (MonadResource m, MonadBaseControl IO m, Failure C.HttpException m)
+  (MonadResource m, MonadBaseControl IO m, Failure HttpException m)
 
 type MonadRestfulOuter m =
   (MonadIO m, MonadUnsafeIO m, MonadThrow m,
-   MonadBaseControl IO m, Failure C.HttpException m)
+   MonadBaseControl IO m, Failure HttpException m)
 
 restfulBody :: MonadRestfulInner m =>
-               C.RequestBody (ResourceT m) -> RESTful ()
+               RequestBody (ResourceT m) -> RESTful ()
                -> m (ResumableSource (ResourceT m) ByteString)
 -- jww (2012-12-26): withManager needs to move to the user scope, but we can
 -- create a reader environment that may or may not receive a manager from the
 -- user, and that environment will bring the manager down to here.
-restfulBody body rest = C.withManager $ \mgr -> do
-  req <- buildRequest $ execState rest (def :: PreRequest)
-  C.responseBody <$> C.http req { C.requestBody = body } mgr
+restfulBody body rest = withManager $ \mgr -> do
+  req <- buildRequest $ execState rest (def :: RESTfulEnv)
+  responseBody <$> http req { requestBody = body } mgr
 
 restfulRawWith :: MonadRestfulInner m =>
-                  C.RequestBody (ResourceT m) -> RESTful ()
+                  RequestBody (ResourceT m) -> RESTful ()
                   -> m (Maybe ByteString)
 restfulRawWith reqBody rest = do
   respBody <- restfulBody reqBody rest
   runResourceT $ respBody $$+- await
 
 restfulRaw :: MonadRestfulInner m => RESTful () -> m (Maybe ByteString)
-restfulRaw = restfulRawWith (C.RequestBodyBS B.empty)
+restfulRaw = restfulRawWith (RequestBodyBS B.empty)
 
 restfulWith :: (MonadRestfulInner m, FromJSON a) =>
-           C.RequestBody (ResourceT m) -> RESTful () -> m (Maybe a)
+           RequestBody (ResourceT m) -> RESTful () -> m (Maybe a)
 restfulWith reqBody rest = do
   content <- restfulRawWith reqBody rest
   return $ maybe Nothing (decode . BL.fromChunks . (:[])) content
 
 restful :: (MonadRestfulInner m, FromJSON a) => RESTful () -> m (Maybe a)
-restful = restfulWith (C.RequestBodyBS B.empty)
+restful = restfulWith (RequestBodyBS B.empty)
 
 restfulUrlRaw :: MonadRestfulOuter m =>
-                 Method -> C.RequestBody (ResourceT (ResourceT m)) -> Text
+                 Method -> RequestBody (ResourceT (ResourceT m)) -> Text
                  -> RESTful () -> m (Maybe ByteString)
 restfulUrlRaw meth body url env =
-  runResourceT $ restfulRawWith body $ _method .= meth >> setUrl url >> env
+  runResourceT $ restfulRawWith body $
+    _request._method .= meth >> setUrl url >> env
 
 restfulGetRaw :: MonadRestfulOuter m => Text -> m (Maybe ByteString)
 restfulGetRaw url =
-  restfulUrlRaw methodGet (C.RequestBodyBS B.empty) url (return ())
+  restfulUrlRaw methodGet (RequestBodyBS B.empty) url (return ())
 
 restfulGetRawEx :: MonadRestfulOuter m =>
                    Text -> RESTful () -> m (Maybe ByteString)
-restfulGetRawEx = restfulUrlRaw methodGet (C.RequestBodyBS B.empty)
+restfulGetRawEx = restfulUrlRaw methodGet (RequestBodyBS B.empty)
 
 restfulHeadRaw :: MonadRestfulOuter m => Text -> m (Maybe ByteString)
 restfulHeadRaw url =
-  restfulUrlRaw methodHead (C.RequestBodyBS B.empty) url (return ())
+  restfulUrlRaw methodHead (RequestBodyBS B.empty) url (return ())
 
 restfulHeadRawEx :: MonadRestfulOuter m =>
                     Text -> RESTful () -> m (Maybe ByteString)
-restfulHeadRawEx = restfulUrlRaw methodHead (C.RequestBodyBS B.empty)
+restfulHeadRawEx = restfulUrlRaw methodHead (RequestBodyBS B.empty)
 
 restfulPostRawBS :: MonadRestfulOuter m =>
                     ByteString -> Text -> m (Maybe ByteString)
 restfulPostRawBS body url =
-  restfulUrlRaw methodPost (C.RequestBodyBS body) url (return ())
+  restfulUrlRaw methodPost (RequestBodyBS body) url (return ())
 
 restfulPostRawBSEx :: MonadRestfulOuter m =>
                       ByteString -> Text -> RESTful () -> m (Maybe ByteString)
-restfulPostRawBSEx body = restfulUrlRaw methodPost (C.RequestBodyBS body)
+restfulPostRawBSEx body = restfulUrlRaw methodPost (RequestBodyBS body)
 
 restfulPostRaw :: MonadRestfulOuter m =>
-                  C.RequestBody (ResourceT (ResourceT m)) -> Text
+                  RequestBody (ResourceT (ResourceT m)) -> Text
                   -> m (Maybe ByteString)
 restfulPostRaw body url = restfulUrlRaw methodPost body url (return ())
 
 restfulPostRawEx :: MonadRestfulOuter m =>
-                    C.RequestBody (ResourceT (ResourceT m)) -> Text
+                    RequestBody (ResourceT (ResourceT m)) -> Text
                     -> RESTful () -> m (Maybe ByteString)
 restfulPostRawEx = restfulUrlRaw methodPost
 
 restfulUrl :: (MonadRestfulOuter m, FromJSON a) =>
-              Method -> C.RequestBody (ResourceT (ResourceT m)) -> Text
+              Method -> RequestBody (ResourceT (ResourceT m)) -> Text
               -> RESTful () -> m (Maybe a)
 restfulUrl meth body url env =
-  runResourceT $ restfulWith body $ _method .= meth >> setUrl url >> env
+  runResourceT $ restfulWith body $
+    _request._method .= meth >> setUrl url >> env
 
 restfulGet :: (MonadRestfulOuter m, FromJSON a) => Text -> m (Maybe a)
 restfulGet url =
-  restfulUrl methodGet (C.RequestBodyBS B.empty) url (return ())
+  restfulUrl methodGet (RequestBodyBS B.empty) url (return ())
 
 restfulGetEx :: (MonadRestfulOuter m, FromJSON a) => Text -> RESTful ()
                 -> m (Maybe a)
-restfulGetEx = restfulUrl methodGet (C.RequestBodyBS B.empty)
+restfulGetEx = restfulUrl methodGet (RequestBodyBS B.empty)
 
 restfulHead :: (MonadRestfulOuter m, FromJSON a) => Text -> m (Maybe a)
 restfulHead url =
-  restfulUrl methodHead (C.RequestBodyBS B.empty) url (return ())
+  restfulUrl methodHead (RequestBodyBS B.empty) url (return ())
 
 restfulHeadEx :: (MonadRestfulOuter m, FromJSON a) => Text -> RESTful ()
                  -> m (Maybe a)
-restfulHeadEx = restfulUrl methodHead (C.RequestBodyBS B.empty)
+restfulHeadEx = restfulUrl methodHead (RequestBodyBS B.empty)
 
 restfulPostBS :: (MonadRestfulOuter m, FromJSON a) =>
                  ByteString -> Text -> m (Maybe a)
 restfulPostBS body url =
-  restfulUrl methodPost (C.RequestBodyBS body) url (return ())
+  restfulUrl methodPost (RequestBodyBS body) url (return ())
 
 restfulPostBSEx :: (MonadRestfulOuter m, FromJSON a) =>
                  ByteString -> Text -> RESTful () -> m (Maybe a)
-restfulPostBSEx body = restfulUrl methodPost (C.RequestBodyBS body)
+restfulPostBSEx body = restfulUrl methodPost (RequestBodyBS body)
 
 restfulPost :: (MonadRestfulOuter m, ToJSON a, FromJSON b) =>
                a -> Text -> m (Maybe b)
 restfulPost v url =
-  restfulUrl methodPost (C.RequestBodyLBS (encode (toJSON v))) url (return ())
+  restfulUrl methodPost (RequestBodyLBS (encode (toJSON v))) url (return ())
 
 restfulPostEx :: (MonadRestfulOuter m, ToJSON a, FromJSON b) =>
                  a -> Text -> RESTful () -> m (Maybe b)
-restfulPostEx v = restfulUrl methodPost (C.RequestBodyLBS (encode (toJSON v)))
+restfulPostEx v = restfulUrl methodPost (RequestBodyLBS (encode (toJSON v)))
 
 -- Client.hs
