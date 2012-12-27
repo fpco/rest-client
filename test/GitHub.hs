@@ -24,6 +24,11 @@ data Blob = Blob { blobContent  :: ByteString
                  , blobSha      :: Text
                  , blobSize     :: Int } deriving Show
 
+-- jww (2012-12-26): Create ToREST and FromREST, which encode/decode to/from
+-- byte _streams_ in order to make rest-client representation agnostic, while
+-- keeping the UI simple
+-- jww (2012-12-26): If no name mangling scheme is provided, assume it is
+-- "type name prefix"
 instance FromJSON Blob where
   parseJSON (Object v) = Blob <$> v .: "content"
                               <*> v .: "encoding"
@@ -31,12 +36,17 @@ instance FromJSON Blob where
                               <*> v .: "size"
   parseJSON _ = mzero
 
+-- jww (2012-12-26): Use a MonadReader to pass the token, owner and repo to
+-- all GitHub API calls
 gitHubReadBlob :: Text -> Text -> Text -> IO (Either String ByteString)
 gitHubReadBlob owner repo sha = do
   blob <- restfulGet
     [st|https://api.github.com/repos/#{owner}/#{repo}/git/blobs/#{sha}|]
   return $ maybe (Left "Blob not found") dec (blobContent <$> blob)
+  -- jww (2012-12-26): Handle utf-8 and other encodings
   where dec = B64.decode . B.concat . B.split 10
+  -- jww (2012-12-26): Need to add support for passing in a Maybe Text token
+  -- in order to read from private repositories
 
 data Content = Content { contentContent  :: ByteString
                        , contentEncoding :: Text } deriving Show
@@ -47,6 +57,7 @@ instance FromJSON Content where
   parseJSON _ = mzero
 
 instance ToJSON Content where
+  -- jww (2012-12-26): The content here needs to be base64
   toJSON (Content bs enc) = object ["content" .= bs, "encoding" .= enc]
 
 instance Default Content where
@@ -156,8 +167,12 @@ instance ToJSON Commit where
 
 gitHubReadCommit :: Text -> Text -> Text -> IO (Maybe Commit)
 gitHubReadCommit owner repo sha =
-  restfulGet
-    [st|https://api.github.com/repos/#{owner}/#{repo}/git/commits/#{sha}|]
+  -- jww (2012-12-26): Support inserting the method name directly before the
+  -- URL.
+  -- jww (2012-12-26): Do we want runtime checking of the validity of the
+  -- method?  Yes, but allow the user to declare it as OK.
+  restful
+    [st|GET https://api.github.com/repos/#{owner}/#{repo}/git/commits/#{sha}|]
 
 gitHubWriteCommit :: Text -> Text -> Text -> Commit -> IO (Maybe Commit)
 gitHubWriteCommit token owner repo commit =

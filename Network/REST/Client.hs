@@ -34,6 +34,8 @@ import           Network.TLS ( PrivateKey )
 type ContentType = ByteString
 type RequestPath = Either Text (Query,[Text])
 
+-- jww (2012-12-26): I could perhaps use:
+--   newtype PreRequest = Request Identity
 data PreRequest = PreRequest
     { method :: Method                  -- HTTP request method, eg GET, POST.
     , path :: RequestPath
@@ -123,6 +125,8 @@ setMethod = (_method .=)
 addQueryParam :: Text -> Text -> RESTful ()
 addQueryParam key val = do
   let q = (E.encodeUtf8 key,Just (E.encodeUtf8 val))
+  -- jww (2012-12-26): Promote path to a Right.  Perhaps I can just use a
+  -- special lens that views the Left as the equivalent Right.
   _path._right._1 %= (++ [q])
 
 addHeader :: Text -> Text -> RESTful ()
@@ -131,6 +135,8 @@ addHeader name val =
 
 buildRequest :: Failure C.HttpException m => PreRequest -> m (C.Request m)
 buildRequest p = do
+  -- jww (2012-12-26): Use Network.URI to parse/decode the URI and then
+  -- recompose it using http-types
   req <- C.parseUrl (either unpack buildUrl (path p))
   let req' = req {
           C.method             = method p
@@ -154,6 +160,8 @@ buildRequest p = do
   where buildUrl = BC.unpack . toByteString . uncurry encodePath . swap
 
 type MonadRestfulInner m =
+  -- jww (2012-12-26): MonadResource will change/move once I move withManager
+  -- out the user level
   (MonadResource m, MonadBaseControl IO m, Failure C.HttpException m)
 
 type MonadRestfulOuter m =
@@ -163,6 +171,9 @@ type MonadRestfulOuter m =
 restfulBody :: MonadRestfulInner m =>
                C.RequestBody (ResourceT m) -> RESTful ()
                -> m (ResumableSource (ResourceT m) ByteString)
+-- jww (2012-12-26): withManager needs to move to the user scope, but we can
+-- create a reader environment that may or may not receive a manager from the
+-- user, and that environment will bring the manager down to here.
 restfulBody body rest = C.withManager $ \mgr -> do
   req <- buildRequest $ execState rest (def :: PreRequest)
   C.responseBody <$> C.http req { C.requestBody = body } mgr
