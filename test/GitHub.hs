@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
 
@@ -5,15 +6,17 @@ module Main where
 
 import           Control.Applicative
 import           Control.Monad
+import           Control.Monad.IO.Class
 import           Data.Aeson
 import           Data.ByteString as B hiding (pack)
 import qualified Data.ByteString.Base64 as B64
+import           Data.Conduit
 import           Data.Default ( Default(..) )
 import           Data.Maybe
 import           Data.Monoid
 import           Data.Text as T hiding (drop)
 import           Data.Text.Encoding as E
-import           Network.HTTP.Types
+import           Network.HTTP.Conduit
 import           Network.REST.Client
 import           Network.Socket
 import           System.Environment
@@ -38,10 +41,10 @@ instance FromJSON Blob where
 
 -- jww (2012-12-26): Use a MonadReader to pass the token, owner and repo to
 -- all GitHub API calls
-gitHubReadBlob :: Text -> Text -> Text -> IO (Either String ByteString)
+gitHubReadBlob :: Text -> Text -> Text -> RESTfulM (Either String ByteString)
 gitHubReadBlob owner repo sha = do
-  blob <- restfulGet
-    [st|https://api.github.com/repos/#{owner}/#{repo}/git/blobs/#{sha}|]
+  blob <- restful ()
+    [st|GET https://api.github.com/repos/#{owner}/#{repo}/git/blobs/#{sha}|]
   return $ maybe (Left "Blob not found") dec (blobContent <$> blob)
   -- jww (2012-12-26): Handle utf-8 and other encodings
   where dec = B64.decode . B.concat . B.split 10
@@ -72,11 +75,10 @@ instance FromJSON Sha where
 instance ToJSON Sha where
   toJSON (Sha sha) = object ["sha" .= sha]
 
-gitHubWriteBlob :: Text -> Text -> Text -> ByteString -> IO (Maybe Sha)
-gitHubWriteBlob token owner repo content =
-  restfulPostEx (Content content "utf-8")
-    [st|https://api.github.com/repos/#{owner}/#{repo}/git/blobs|] $
-    addHeader "Authorization" ("token " <> token)
+gitHubWriteBlob :: Text -> Text -> ByteString -> RESTfulIO (Maybe Sha)
+gitHubWriteBlob owner repo content =
+  restful (Content content "utf-8")
+    [st|POST https://api.github.com/repos/#{owner}/#{repo}/git/blobs|]
 
 data Tree = Tree { treeSha  :: Text
                  , treeTree :: [TreeEntry] }
@@ -113,16 +115,15 @@ instance ToJSON TreeEntry where
                         , "mode" .= treeEntryMode entry
                         , "sha"  .= treeEntrySha entry ]
 
-gitHubReadTree :: Text -> Text -> Text -> IO (Maybe Tree)
+gitHubReadTree :: Text -> Text -> Text -> RESTfulIO (Maybe Tree)
 gitHubReadTree owner repo sha =
-  restfulGet
-    [st|https://api.github.com/repos/#{owner}/#{repo}/git/trees/#{sha}|]
+  restful ()
+    [st|GET https://api.github.com/repos/#{owner}/#{repo}/git/trees/#{sha}|]
 
-gitHubWriteTree :: Text -> Text -> Text -> Tree -> IO (Maybe Tree)
-gitHubWriteTree token owner repo tree =
-  restfulPostEx tree
-    [st|https://api.github.com/repos/#{owner}/#{repo}/git/trees|] $
-    addHeader "Authorization" ("token " <> token)
+gitHubWriteTree :: Text -> Text -> Tree -> RESTfulIO (Maybe Tree)
+gitHubWriteTree owner repo tree =
+  restful tree
+    [st|POST https://api.github.com/repos/#{owner}/#{repo}/git/trees|]
 
 data Signature = Signature { signatureDate  :: Text
                            , signatureName  :: Text
@@ -165,20 +166,17 @@ instance ToJSON Commit where
                       [ "committer" .= fromJust (commitCommitter c) |
                         isJust (commitCommitter c) ]
 
-gitHubReadCommit :: Text -> Text -> Text -> IO (Maybe Commit)
+gitHubReadCommit :: Text -> Text -> Text -> RESTfulEnvT (ResourceT IO) (Maybe Commit)
 gitHubReadCommit owner repo sha =
-  -- jww (2012-12-26): Support inserting the method name directly before the
-  -- URL.
   -- jww (2012-12-26): Do we want runtime checking of the validity of the
   -- method?  Yes, but allow the user to declare it as OK.
-  restful
+  restful ()
     [st|GET https://api.github.com/repos/#{owner}/#{repo}/git/commits/#{sha}|]
 
-gitHubWriteCommit :: Text -> Text -> Text -> Commit -> IO (Maybe Commit)
-gitHubWriteCommit token owner repo commit =
-  restfulPostEx commit
-    [st|https://api.github.com/repos/#{owner}/#{repo}/git/commits|] $
-    addHeader "Authorization" ("token " <> token)
+gitHubWriteCommit :: Text -> Text -> Commit -> RESTfulIO (Maybe Commit)
+gitHubWriteCommit owner repo commit =
+  restful commit
+    [st|POST https://api.github.com/repos/#{owner}/#{repo}/git/commits|]
 
 data ObjectRef = ObjectRef { objectRefType :: Text
                            , objectRefSha  :: Text } deriving Show
@@ -204,55 +202,59 @@ instance ToJSON Reference where
   toJSON c = object $ [ "ref"    .= referenceRef c
                       , "object" .= referenceObject c ]
 
-gitHubGetRef :: Text -> Text -> Text -> IO (Maybe Reference)
+gitHubGetRef :: Text -> Text -> Text -> RESTfulIO (Maybe Reference)
 gitHubGetRef owner repo ref =
-  restfulGet
-    [st|https://api.github.com/repos/#{owner}/#{repo}/git/#{ref}|]
+  restful ()
+    [st|GET https://api.github.com/repos/#{owner}/#{repo}/git/#{ref}|]
 
-gitHubGetAllRefs :: Text -> Text -> Text -> IO (Maybe [Reference])
+gitHubGetAllRefs :: Text -> Text -> Text -> RESTfulIO (Maybe [Reference])
 gitHubGetAllRefs owner repo namespace =
-  restfulGet
-    [st|https://api.github.com/repos/#{owner}/#{repo}/git/#{namespace}|]
+  restful ()
+    [st|GET https://api.github.com/repos/#{owner}/#{repo}/git/#{namespace}|]
 
-gitHubCreateRef :: Text -> Text -> Text -> Reference -> IO (Maybe Reference)
-gitHubCreateRef token owner repo ref =
-  restfulPostEx ref
-    [st|https://api.github.com/repos/#{owner}/#{repo}/git/refs|] $
-    addHeader "Authorization" ("token " <> token)
+gitHubCreateRef :: Text -> Text -> Reference -> RESTfulIO (Maybe Reference)
+gitHubCreateRef owner repo ref =
+  restful ref
+    [st|POST https://api.github.com/repos/#{owner}/#{repo}/git/refs|]
 
-gitHubUpdateRef :: Text -> Text -> Text -> Text -> Sha -> IO (Maybe Reference)
-gitHubUpdateRef token owner repo ref sha =
-  restfulPostEx sha
-    [st|https://api.github.com/repos/#{owner}/#{repo}/git/#{ref}|] $ do
-      setMethod "PATCH"
-      addQueryParam "force" True
-      addHeader "Authorization" ("token " <> token)
+gitHubUpdateRef :: Text -> Text -> Text -> Sha -> RESTfulM (Maybe Reference)
+gitHubUpdateRef owner repo ref sha =
+  restfulEx sha
+    [st|PATCH https://api.github.com/repos/#{owner}/#{repo}/git/#{ref}|]
+    $ addQueryParam "force" "true"
 
-gitHubDeleteRef :: Text -> Text -> Text -> Text -> IO ()
-gitHubDeleteRef token owner repo ref = undefined
+gitHubDeleteRef :: Text -> Text -> Text -> RESTfulM ()
+gitHubDeleteRef owner repo ref =
+  restful_ ref
+    [st|DELETE #{view (_vars.element "prefix")}/#{ref}|]
 
 main :: IO ()
 main = withSocketsDo $ do
   [token] <- getArgs
 
-  let sha = "3340a84bddc2c1a945b4e1ad232f4e1d0ae2a2dc"
-  print =<< gitHubReadBlob "fpco" "gitlib" sha
-  print =<< gitHubWriteBlob (pack token) "fpco" "gitlib"
-                            (E.encodeUtf8 "Hello, world!")
+  let owner = "fpco"
+      repo  = "gitlib"
 
-  print =<< gitHubReadTree "fpco" "gitlib"
-                           "d2ce27a394f9fa8ce5a83fb52405a2701feeadd3"
-  let tree =
-        Tree { treeSha = ""
-             , treeTree = [
-                  TreeEntry { treeEntryType = "blob"
-                            , treeEntryMode = "100644"
-                            , treeEntryPath = "sample"
-                            , treeEntrySha  = sha
-                            , treeEntrySize = (-1) } ] }
-  print =<< gitHubWriteTree (pack token) "fpco" "gitlib" tree
+  withManager $ \mgr ->
+    withRestfulEnvAndMgr mgr
+      (do addHeader "Authorization" ("token " <> pack token)
+          setVar "prefix" "foo") $
+      do let sha = "3340a84bddc2c1a945b4e1ad232f4e1d0ae2a2dc"
+         liftIO . print =<< gitHubReadBlob owner repo sha
+         liftIO . print =<<
+           gitHubWriteBlob owner repo (E.encodeUtf8 "Hello, world!")
 
-  let csha = "a3f4494be204612f7bd526d65cd8db587e32c46d"
-  print =<< gitHubReadCommit "fpco" "gitlib" csha
+         liftIO . print =<<
+           gitHubReadTree owner repo "d2ce27a394f9fa8ce5a83fb52405a2701feeadd3"
+         let tree =
+               Tree { treeTree = [
+                         TreeEntry { treeEntryType = "blob"
+                                   , treeEntryMode = "100644"
+                                   , treeEntryPath = "sample"
+                                   , treeEntrySha  = sha } ] }
+         liftIO . print =<< gitHubWriteTree owner repo tree
+         liftIO . print =<<
+           gitHubReadCommit owner repo
+                            "a3f4494be204612f7bd526d65cd8db587e32c46d"
 
 -- GitHub.hs
