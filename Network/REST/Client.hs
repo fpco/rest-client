@@ -38,24 +38,14 @@ import           Network.URI
 import           Prelude hiding (lookup)
 
 type ContentType = ByteString
-type RequestPath = Either Text (Query,[Text])
 type RequestId   = Request Identity
 
-_method :: Functor f => (Method -> f Method) -> RequestId -> f RequestId
-_method f req = f (method req) <&> \v -> req { method = v }
-_host :: Functor f => (ByteString -> f ByteString) -> RequestId -> f RequestId
-_host f req = f (host req) <&> \v -> req { host = v }
-_port :: Functor f => (Int -> f Int) -> RequestId -> f RequestId
-_port f req = f (port req) <&> \v -> req { port = v }
-_secure :: Functor f => (Bool -> f Bool) -> RequestId -> f RequestId
-_secure f req = f (secure req) <&> \v -> req { secure = v }
-_headers :: Functor f =>
-            (RequestHeaders -> f RequestHeaders) -> RequestId -> f RequestId
+_method f req  = f (method req)         <&> \v -> req { method = v }
+_host f req    = f (host req)           <&> \v -> req { host = v }
+_port f req    = f (port req)           <&> \v -> req { port = v }
+_secure f req  = f (secure req)         <&> \v -> req { secure = v }
 _headers f req = f (requestHeaders req) <&> \v -> req { requestHeaders = v }
-_body :: Functor f =>
-         (RequestBody Identity -> f (RequestBody Identity)) -> RequestId
-         -> f RequestId
-_body f req = f (requestBody req) <&> \v -> req { requestBody = v }
+_body f req    = f (requestBody req)    <&> \v -> req { requestBody = v }
 
 mergeRequests :: RequestId -> RequestId -> RequestId
 mergeRequests x y =
@@ -94,20 +84,13 @@ data RESTfulRequest = RESTfulRequest { request      :: RequestId
                                      , requestVars  :: Map Text Text
                                      , queryParams  :: QueryText }
 
-_request :: Functor f =>
-            (RequestId -> f RequestId) -> RESTfulRequest -> f RESTfulRequest
-_request f env = f (request env) <&> \v -> env { request = v }
-_uri :: Functor f => (Text -> f Text) -> RESTfulRequest -> f RESTfulRequest
-_uri f env = f (remoteUri env) <&> \v -> env { remoteUri = v }
-_path :: Functor f => ([Text] -> f [Text]) -> RESTfulRequest -> f RESTfulRequest
-_path f env = f (pathSegments env) <&> \v -> env { pathSegments = v }
-_query :: Functor f =>
-          (QueryText -> f QueryText) -> RESTfulRequest -> f RESTfulRequest
-_query f env = f (queryParams env) <&> \v -> env { queryParams = v }
-_vars :: Functor f =>
-         (Map Text Text -> f (Map Text Text)) -> RESTfulRequest
-         -> f RESTfulRequest
-_vars f env = f (requestVars env) <&> \v -> env { requestVars = v }
+_request f env = f (request env)      <&> \v -> env { request = v }
+_uri f env     = f (remoteUri env)    <&> \v -> env { remoteUri = v }
+_path f env    = f (pathSegments env) <&> \v -> env { pathSegments = v }
+_query f env   = f (queryParams env)  <&> \v -> env { queryParams = v }
+_vars f env    = f (requestVars env)  <&> \v -> env { requestVars = v }
+
+type RESTful = State RESTfulRequest
 
 instance Default RESTfulRequest where
   def = RESTfulRequest { request      = def
@@ -128,8 +111,6 @@ instance Monoid RESTfulRequest where
       , requestVars  = fromList (toList (requestVars x) `mappend`
                                  toList (requestVars y))
       , queryParams  = queryParams x  `mappend` queryParams y }
-
-type RESTful = State RESTfulRequest
 
 addPath :: Text -> RESTful ()
 addPath segment = _path <>= [segment]

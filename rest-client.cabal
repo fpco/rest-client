@@ -9,11 +9,14 @@ author:              John Wiegley
 maintainer:          johnw@fpcomplete.com
 -- copyright:           
 category:            Network
-build-type:          Simple
+build-type:          Custom
 cabal-version:       >=1.8
+
+extra-Source-Files:  docs/images/foo.png
 
 library
   exposed-modules:     Network.REST.Client
+                     , Network.REST.Tutorial
   -- other-modules:       
   build-depends:       base              >= 4.5
                      , aeson             >= 0.6.1.0
