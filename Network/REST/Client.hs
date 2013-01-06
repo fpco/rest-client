@@ -60,7 +60,7 @@ mergeRequests x y =
     , requestHeaders = requestHeaders x <> requestHeaders y
     , C.path = if C.path y == "/"
                then C.path x
-               else C.path x
+               else C.path y
     , queryString = if queryString y == BC.empty
                     then queryString x
                     else queryString y
@@ -138,7 +138,11 @@ addHeader :: Text -> Text -> RESTful ()
 addHeader name val =
   _request._headers <>= [(mk (E.encodeUtf8 name), E.encodeUtf8 val)]
 
+-- jww (2013-01-06): Instead of using shakespeare-text, look at the code and
+-- build my own quasi-quoter specifically for the REST library
 data RESTfulEnv = RESTfulEnv { restfulManager :: Manager
+                           -- jww (2013-01-06): Check out Map TypeRep Dynamic
+                           -- at https://github.com/yesodweb/yesod/issues/268
                              , restfulArgs    :: Map Text Text
                              , restfulPrereq  :: RESTful () }
 
@@ -269,13 +273,13 @@ restful_ val url = void (restfulRawExL (encode val) url (return ()))
 type RESTfulIO = RESTfulEnvT (ResourceT IO)
 
 withRestfulEnvAndMgr ::
-  Monad m =>
-  Manager -> RESTful () -> RESTfulEnvT (ResourceT m) a -> ResourceT m a
+  MonadResource m => Manager -> RESTful () -> RESTfulEnvT m a -> m a
 withRestfulEnvAndMgr mgr rest action =
-  runReaderT action
-    (RESTfulEnv { restfulManager = mgr
-                , restfulPrereq  = rest })
+  runReaderT action (RESTfulEnv { restfulManager = mgr
+                                , restfulPrereq  = rest })
 
+-- jww (2013-01-06): Create a type class called HasManager that allows you to
+-- grab a manager from it.  Then we wouldn't have to call withManager.
 type RESTfulM a = forall (m :: * -> *).
                   (Failure HttpException m, MonadResource m,
                    MonadBaseControl IO m) => RESTfulEnvT m a
