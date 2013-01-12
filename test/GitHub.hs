@@ -32,6 +32,8 @@ data Blob = Blob { blobContent  :: ByteString
 -- keeping the UI simple
 -- jww (2012-12-26): If no name mangling scheme is provided, assume it is
 -- "type name prefix"
+-- jww (2013-01-12): Look into using JsonGrammar to automate JSON encoding and
+-- decoding: https://github.com/MedeaMelana/JsonGrammar
 instance FromJSON Blob where
   parseJSON (Object v) = Blob <$> v .: "content"
                               <*> v .: "encoding"
@@ -43,13 +45,17 @@ instance FromJSON Blob where
 -- all GitHub API calls
 gitHubReadBlob :: Text -> Text -> Text -> RESTfulM (Either String ByteString)
 gitHubReadBlob owner repo sha = do
-  blob <- restful ()
-    [st|GET https://api.github.com/repos/#{owner}/#{repo}/git/blobs/#{sha}|]
-  return $ maybe (Left "Blob not found") dec (blobContent <$> blob)
-  -- jww (2012-12-26): Handle utf-8 and other encodings
-  where dec = B64.decode . B.concat . B.split 10
-  -- jww (2012-12-26): Need to add support for passing in a Maybe Text token
-  -- in order to read from private repositories
+    -- jww (2013-01-12): Split out GET to its own argument, using StdMethod
+    -- from http-types.  Also, use a type class for this argument, to be added
+    -- to http-types:
+    --     class IsHttpMethod a where asHttpMethod :: a -> ByteString
+    blob <- restful ()
+        [st|GET https://api.github.com/repos/#{owner}/#{repo}/git/blobs/#{sha}|]
+    return $ maybe (Left "Blob not found") dec (blobContent <$> blob)
+    -- jww (2012-12-26): Handle utf-8 and other encodings
+    where dec = B64.decode . B.concat . B.split 10
+    -- jww (2012-12-26): Need to add support for passing in a Maybe Text token
+    -- in order to read from private repositories
 
 data Content = Content { contentContent  :: ByteString
                        , contentEncoding :: Text } deriving Show
@@ -219,9 +225,13 @@ gitHubCreateRef owner repo ref =
 
 gitHubUpdateRef :: Text -> Text -> Text -> Sha -> RESTfulM (Maybe Reference)
 gitHubUpdateRef owner repo ref sha =
-  restfulEx sha
-    [st|PATCH https://api.github.com/repos/#{owner}/#{repo}/git/#{ref}|]
-    $ addQueryParam "force" "true"
+    -- jww (2013-01-12): restfulEx with a state argument is awkward.  Maybe
+    -- have addQueryParam take a third parameter that modifies a RESTfulM's
+    -- internal state value, and then do restful ... & addQueryParam, where &
+    -- = flip ($)
+    restfulEx sha
+        [st|PATCH https://api.github.com/repos/#{owner}/#{repo}/git/#{ref}|]
+        $ addQueryParam "force" "true"
 
 gitHubDeleteRef :: Text -> Text -> Text -> RESTfulM ()
 gitHubDeleteRef owner repo ref =
