@@ -115,8 +115,9 @@ instance Monoid RESTfulRequest where
 addPath :: Text -> RESTful ()
 addPath segment = _path <>= [segment]
 
-addDynPath :: (Show a) => a -> RESTful ()
-addDynPath = addPath . pack . show
+-- -- jww (2013-01-06): use PathPiece here instead of show
+-- addDynPath :: PathPiece a => a -> RESTful ()
+-- addDynPath = addPath . toPathPiece
 
 setUrl :: Text -> RESTful ()
 setUrl = (_uri .=)
