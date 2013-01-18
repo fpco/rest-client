@@ -1,10 +1,7 @@
 {-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE KindSignatures #-}
-{-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ViewPatterns #-}
 
@@ -18,7 +15,7 @@ import           Control.Monad.IO.Class
 import           Control.Monad.Trans.Class
 import           Control.Monad.Trans.Reader
 import           Control.Monad.Trans.State.Lazy
-import           Data.Aeson hiding ( (.=) )
+import           Data.Aeson hiding ((.=))
 import           Data.Attempt
 import           Data.ByteString as B ( ByteString )
 import qualified Data.ByteString.Char8 as BC
@@ -28,14 +25,17 @@ import           Data.Conduit
 import           Data.Default ( Default(..) )
 import           Data.Functor.Identity
 import           Data.Map hiding ( null )
+import           Data.Marshal
 import           Data.Monoid
+import           Data.Proxy hiding (proxy)
 import           Data.Text ( Text, unpack, pack )
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as E
-import           Network.HTTP.Conduit as C
+import           Network.HTTP.Conduit as C hiding (Proxy)
 import           Network.HTTP.Types
 import           Network.URI
 import           Prelude hiding (lookup)
+import           Web.PathPieces
 
 type ContentType = ByteString
 type RequestId   = Request Identity
@@ -115,9 +115,8 @@ instance Monoid RESTfulRequest where
 addPath :: Text -> RESTful ()
 addPath segment = _path <>= [segment]
 
--- -- jww (2013-01-06): use PathPiece here instead of show
--- addDynPath :: PathPiece a => a -> RESTful ()
--- addDynPath = addPath . toPathPiece
+addDynPath :: PathPiece a => a -> RESTful ()
+addDynPath = addPath . toPathPiece
 
 setUrl :: Text -> RESTful ()
 setUrl = (_uri .=)
@@ -144,6 +143,7 @@ addHeader name val =
 data RESTfulEnv = RESTfulEnv { restfulManager :: Manager
                            -- jww (2013-01-06): Check out Map TypeRep Dynamic
                            -- at https://github.com/yesodweb/yesod/issues/268
+                           -- and allow arg lookup using the custom quasi-quoter
                              , restfulArgs    :: Map Text Text
                              , restfulPrereq  :: RESTful () }
 
@@ -223,11 +223,18 @@ restfulGetResponseBody rest = do
   respBody <- restfulMakeRequest rest
   lift $ respBody $$+- await
 
-restfulGetAndDecode :: (RestfulInner m, FromJSON b) =>
-                       RESTful () -> RESTfulEnvT m (Maybe b)
-restfulGetAndDecode rest = do
-  content <- restfulGetResponseBody rest
-  return $ maybe Nothing (decode . BL.fromChunks . (:[])) content
+applyAndDecode ::
+    (RestfulInner m, TranslatableFrom b v) =>
+    Proxy v -> RESTfulEnvT m (Maybe ByteString) -> RESTfulEnvT m (Attempt b)
+applyAndDecode x action = do
+  content <- action
+  return $ case content of
+      Nothing -> Failure (TranslationException "Failed to decode value")
+      Just bs -> unwrap (BL.fromChunks [bs]) x
+
+restfulGetAndDecode :: (RestfulInner m, TranslatableFrom b v) =>
+                       Proxy v -> RESTful () -> RESTfulEnvT m (Attempt b)
+restfulGetAndDecode x = applyAndDecode x . restfulGetResponseBody
 
 restfulRawEx_ :: RestfulInner m =>
                  RequestBody Identity -> Text -> RESTful ()
@@ -258,18 +265,31 @@ restfulRawL :: RestfulInner m =>
                BL.ByteString -> Text -> RESTfulEnvT m (Maybe ByteString)
 restfulRawL body url = restfulRawExL body url (return ())
 
-restfulEx :: (RestfulInner m, ToJSON a, FromJSON b) =>
-             a -> Text -> RESTful () -> RESTfulEnvT m (Maybe b)
-restfulEx val url env = do
-  response <- restfulRawExL (encode val) url env
-  return $ maybe Nothing (decode . BL.fromChunks . (:[])) response
+restfulEx :: (RestfulInner m, TranslatableTo a v, TranslatableFrom b v) =>
+             Proxy v -> a -> Text -> RESTful () -> RESTfulEnvT m (Attempt b)
+restfulEx x val url env = applyAndDecode x $ restfulRawExL (wrap val x) url env
 
-restful :: (RestfulInner m, ToJSON a, FromJSON b) =>
-           a -> Text -> RESTfulEnvT m (Maybe b)
-restful val url = restfulEx val url (return ())
+restful :: (RestfulInner m, TranslatableTo a v, TranslatableFrom b v) =>
+           Proxy v -> a -> Text -> RESTfulEnvT m (Attempt b)
+restful x val url = restfulEx x val url (return ())
 
-restful_ :: (RestfulInner m, ToJSON a) => a -> Text -> RESTfulEnvT m ()
-restful_ val url = void (restfulRawExL (encode val) url (return ()))
+restful_ :: (RestfulInner m, TranslatableTo a v) =>
+            Proxy v -> a -> Text -> RESTfulEnvT m ()
+restful_ x val url = void (restfulRawExL (wrap val x) url (return ()))
+
+restfulJson :: (RestfulInner m,
+                TranslatableTo a Value, TranslatableFrom b Value) =>
+               a -> Text -> RESTfulEnvT m (Attempt b)
+restfulJson = restful (Proxy :: Proxy Value)
+
+restfulJson_ :: (RestfulInner m, TranslatableTo a Value) =>
+               a -> Text -> RESTfulEnvT m ()
+restfulJson_ = restful_ (Proxy :: Proxy Value)
+
+restfulJsonEx :: (RestfulInner m,
+                  TranslatableTo a Value, TranslatableFrom b Value) =>
+                 a -> Text -> RESTful () -> RESTfulEnvT m (Attempt b)
+restfulJsonEx = restfulEx (Proxy :: Proxy Value)
 
 type RESTfulIO = RESTfulEnvT (ResourceT IO)
 
@@ -277,18 +297,26 @@ withRestfulEnvAndMgr ::
   MonadResource m => Manager -> RESTful () -> RESTfulEnvT m a -> m a
 withRestfulEnvAndMgr mgr rest action =
   runReaderT action (RESTfulEnv { restfulManager = mgr
-                                , restfulPrereq  = rest })
+                                , restfulPrereq  = rest
+                                , restfulArgs    = undefined })
 
--- jww (2013-01-06): Create a type class called HasManager that allows you to
--- grab a manager from it.  Then we wouldn't have to call withManager.
+class HasManager m where
+    getManager   :: m Manager
+    applyManager :: (MonadIO m, MonadBaseControl IO m, MonadThrow m,
+                     MonadUnsafeIO m) => (Manager -> ResourceT m a) -> m a
+
+instance HasManager IO where
+    getManager   = newManager def
+    applyManager = withManager
+
 type RESTfulM a = forall (m :: * -> *).
                   (Failure HttpException m, MonadResource m,
                    MonadBaseControl IO m) => RESTfulEnvT m a
 
-withRestfulEnv :: (MonadIO m, MonadUnsafeIO m, MonadBaseControl IO m,
-                   MonadThrow m) =>
+withRestfulEnv :: (MonadIO m, MonadBaseControl IO m, MonadThrow m,
+                   MonadUnsafeIO m, HasManager m) =>
                   RESTful () -> RESTfulEnvT (ResourceT m) a -> m a
 withRestfulEnv rest action =
-  withManager $ \mgr -> withRestfulEnvAndMgr mgr rest action
+  applyManager $ \mgr -> withRestfulEnvAndMgr mgr rest action
 
 -- Client.hs

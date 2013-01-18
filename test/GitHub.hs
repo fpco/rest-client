@@ -1,22 +1,27 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 
 module Main where
 
 import           Control.Applicative
 import           Control.Monad
 import           Control.Monad.IO.Class
-import           Data.Aeson
+import           Data.Aeson hiding (Success)
+import           Data.Attempt
 import           Data.ByteString as B hiding (pack)
 import qualified Data.ByteString.Base64 as B64
 import           Data.Conduit
 import           Data.Default ( Default(..) )
+import           Data.Marshal
+import           Data.Marshal.JSON
 import           Data.Maybe
 import           Data.Monoid
+import           Data.Proxy
 import           Data.Text as T hiding (drop)
 import           Data.Text.Encoding as E
-import           Network.HTTP.Conduit
+import           Network.HTTP.Conduit hiding (Proxy)
 import           Network.REST.Client
 import           Network.Socket
 import           System.Environment
@@ -27,9 +32,6 @@ data Blob = Blob { blobContent  :: ByteString
                  , blobSha      :: Text
                  , blobSize     :: Int } deriving Show
 
--- jww (2012-12-26): Create ToREST and FromREST, which encode/decode to/from
--- byte _streams_ in order to make rest-client representation agnostic, while
--- keeping the UI simple
 -- jww (2012-12-26): If no name mangling scheme is provided, assume it is
 -- "type name prefix"
 -- jww (2013-01-12): Look into using JsonGrammar to automate JSON encoding and
@@ -41,19 +43,20 @@ instance FromJSON Blob where
                               <*> v .: "size"
   parseJSON _ = mzero
 
--- jww (2012-12-26): Use a MonadReader to pass the token, owner and repo to
--- all GitHub API calls
-gitHubReadBlob :: Text -> Text -> Text -> RESTfulM (Either String ByteString)
+gitHubReadBlob :: Text -> Text -> Text -> RESTfulM (Attempt ByteString)
 gitHubReadBlob owner repo sha = do
     -- jww (2013-01-12): Split out GET to its own argument, using StdMethod
     -- from http-types.  Also, use a type class for this argument, to be added
     -- to http-types:
     --     class IsHttpMethod a where asHttpMethod :: a -> ByteString
-    blob <- restful ()
+    blob <- restfulJson ()
         [st|GET https://api.github.com/repos/#{owner}/#{repo}/git/blobs/#{sha}|]
-    return $ maybe (Left "Blob not found") dec (blobContent <$> blob)
+    return $ case dec . blobContent <$> blob of
+        Success (Right bs') -> Success bs'
+        Success (Left str)  -> Failure (TranslationException str)
+        Failure e           -> Failure e
     -- jww (2012-12-26): Handle utf-8 and other encodings
-    where dec = B64.decode . B.concat . B.split 10
+  where dec = B64.decode . B.concat . B.split 10
     -- jww (2012-12-26): Need to add support for passing in a Maybe Text token
     -- in order to read from private repositories
 
@@ -66,7 +69,6 @@ instance FromJSON Content where
   parseJSON _ = mzero
 
 instance ToJSON Content where
-  -- jww (2012-12-26): The content here needs to be base64
   toJSON (Content bs enc) = object ["content" .= bs, "encoding" .= enc]
 
 instance Default Content where
@@ -81,9 +83,9 @@ instance FromJSON Sha where
 instance ToJSON Sha where
   toJSON (Sha sha) = object ["sha" .= sha]
 
-gitHubWriteBlob :: Text -> Text -> ByteString -> RESTfulIO (Maybe Sha)
+gitHubWriteBlob :: Text -> Text -> ByteString -> RESTfulM (Attempt Sha)
 gitHubWriteBlob owner repo content =
-  restful (Content content "utf-8")
+  restfulJson (Content (B64.encode content) "base64")
     [st|POST https://api.github.com/repos/#{owner}/#{repo}/git/blobs|]
 
 data Tree = Tree { treeSha  :: Text
@@ -121,14 +123,14 @@ instance ToJSON TreeEntry where
                         , "mode" .= treeEntryMode entry
                         , "sha"  .= treeEntrySha entry ]
 
-gitHubReadTree :: Text -> Text -> Text -> RESTfulIO (Maybe Tree)
+gitHubReadTree :: Text -> Text -> Text -> RESTfulIO (Attempt Tree)
 gitHubReadTree owner repo sha =
-  restful ()
+  restfulJson ()
     [st|GET https://api.github.com/repos/#{owner}/#{repo}/git/trees/#{sha}|]
 
-gitHubWriteTree :: Text -> Text -> Tree -> RESTfulIO (Maybe Tree)
+gitHubWriteTree :: Text -> Text -> Tree -> RESTfulIO (Attempt Tree)
 gitHubWriteTree owner repo tree =
-  restful tree
+  restfulJson tree
     [st|POST https://api.github.com/repos/#{owner}/#{repo}/git/trees|]
 
 data Signature = Signature { signatureDate  :: Text
@@ -172,16 +174,17 @@ instance ToJSON Commit where
                       [ "committer" .= fromJust (commitCommitter c) |
                         isJust (commitCommitter c) ]
 
-gitHubReadCommit :: Text -> Text -> Text -> RESTfulEnvT (ResourceT IO) (Maybe Commit)
+gitHubReadCommit ::
+    Text -> Text -> Text -> RESTfulEnvT (ResourceT IO) (Attempt Commit)
 gitHubReadCommit owner repo sha =
   -- jww (2012-12-26): Do we want runtime checking of the validity of the
   -- method?  Yes, but allow the user to declare it as OK.
-  restful ()
+  restfulJson ()
     [st|GET https://api.github.com/repos/#{owner}/#{repo}/git/commits/#{sha}|]
 
-gitHubWriteCommit :: Text -> Text -> Commit -> RESTfulIO (Maybe Commit)
+gitHubWriteCommit :: Text -> Text -> Commit -> RESTfulIO (Attempt Commit)
 gitHubWriteCommit owner repo commit =
-  restful commit
+  restfulJson commit
     [st|POST https://api.github.com/repos/#{owner}/#{repo}/git/commits|]
 
 data ObjectRef = ObjectRef { objectRefType :: Text
@@ -208,35 +211,35 @@ instance ToJSON Reference where
   toJSON c = object $ [ "ref"    .= referenceRef c
                       , "object" .= referenceObject c ]
 
-gitHubGetRef :: Text -> Text -> Text -> RESTfulIO (Maybe Reference)
+gitHubGetRef :: Text -> Text -> Text -> RESTfulIO (Attempt Reference)
 gitHubGetRef owner repo ref =
-  restful ()
+  restfulJson ()
     [st|GET https://api.github.com/repos/#{owner}/#{repo}/git/#{ref}|]
 
-gitHubGetAllRefs :: Text -> Text -> Text -> RESTfulIO (Maybe [Reference])
+gitHubGetAllRefs :: Text -> Text -> Text -> RESTfulIO (Attempt [Reference])
 gitHubGetAllRefs owner repo namespace =
-  restful ()
+  restfulJson ()
     [st|GET https://api.github.com/repos/#{owner}/#{repo}/git/#{namespace}|]
 
-gitHubCreateRef :: Text -> Text -> Reference -> RESTfulIO (Maybe Reference)
+gitHubCreateRef :: Text -> Text -> Reference -> RESTfulIO (Attempt Reference)
 gitHubCreateRef owner repo ref =
-  restful ref
+  restfulJson ref
     [st|POST https://api.github.com/repos/#{owner}/#{repo}/git/refs|]
 
-gitHubUpdateRef :: Text -> Text -> Text -> Sha -> RESTfulM (Maybe Reference)
+gitHubUpdateRef :: Text -> Text -> Text -> Sha -> RESTfulM (Attempt Reference)
 gitHubUpdateRef owner repo ref sha =
     -- jww (2013-01-12): restfulEx with a state argument is awkward.  Maybe
     -- have addQueryParam take a third parameter that modifies a RESTfulM's
     -- internal state value, and then do restful ... & addQueryParam, where &
     -- = flip ($)
-    restfulEx sha
+    restfulJsonEx sha
         [st|PATCH https://api.github.com/repos/#{owner}/#{repo}/git/#{ref}|]
         $ addQueryParam "force" "true"
 
 gitHubDeleteRef :: Text -> Text -> Text -> RESTfulM ()
 gitHubDeleteRef owner repo ref =
-  restful_ ref
-    [st|DELETE #{view (_vars.element "prefix")}/#{ref}|]
+  restfulJson_ ref
+    [st|DELETE https://api.github.com/repos/#{owner}/#{repo}/git/#{ref}|]
 
 main :: IO ()
 main = withSocketsDo $ do
@@ -248,7 +251,8 @@ main = withSocketsDo $ do
   withManager $ \mgr ->
     withRestfulEnvAndMgr mgr
       (do addHeader "Authorization" ("token " <> pack token)
-          setVar "prefix" "foo") $
+          -- setVar "prefix" "foo"
+      ) $
       do let sha = "3340a84bddc2c1a945b4e1ad232f4e1d0ae2a2dc"
          liftIO . print =<< gitHubReadBlob owner repo sha
          liftIO . print =<<
