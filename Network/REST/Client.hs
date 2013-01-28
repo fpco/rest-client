@@ -15,13 +15,14 @@ import           Control.Monad.IO.Class
 import           Control.Monad.Trans.Class
 import           Control.Monad.Trans.Reader
 import           Control.Monad.Trans.State.Lazy
-import           Data.Aeson hiding ((.=))
+import           Data.Aeson hiding ((.=), Success)
 import           Data.Attempt
 import           Data.ByteString as B ( ByteString )
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as BL
 import           Data.CaseInsensitive
 import           Data.Conduit
+import           Data.Conduit.List (consume)
 import           Data.Default ( Default(..) )
 import           Data.Functor.Identity
 import           Data.Map hiding ( null )
@@ -31,6 +32,7 @@ import           Data.Proxy hiding (proxy)
 import           Data.Text ( Text, unpack, pack )
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as E
+import           Debug.Trace
 import           Network.HTTP.Conduit as C hiding (Proxy)
 import           Network.HTTP.Types
 import           Network.URI
@@ -39,6 +41,23 @@ import           Web.PathPieces
 
 type ContentType = ByteString
 type RequestId   = Request Identity
+
+instance Show (Request m) where
+    show x = "Request {"
+             ++ "\n  host                 = " ++ show (host x)
+             ++ "\n  port                 = " ++ show (port x)
+             ++ "\n  secure               = " ++ show (secure x)
+             ++ "\n  clientCertificates   = " ++ show (clientCertificates x)
+             ++ "\n  requestHeaders       = " ++ show (requestHeaders x)
+             ++ "\n  path                 = " ++ show (C.path x)
+             ++ "\n  queryString          = " ++ show (queryString x)
+             ++ "\n  requestBody          = " ++ show (requestBody x)
+             ++ "\n  method               = " ++ show (method x)
+             ++ "\n  proxy                = " ++ show (proxy x)
+             ++ "\n  rawBody              = " ++ show (rawBody x)
+             ++ "\n  redirectCount        = " ++ show (redirectCount x)
+             ++ "\n  responseTimeout      = " ++ show (responseTimeout x)
+             ++ "\n}"
 
 _method f req  = f (method req)         <&> \v -> req { method = v }
 _host f req    = f (host req)           <&> \v -> req { host = v }
@@ -169,7 +188,8 @@ getRequestUri rest@(remoteUri -> "") =
 getRequestUri rest =
   let ps  = pathSegments rest
       qs  = queryParams rest
-      uri = parseURI (encodeUri (remoteUri rest))
+      -- jww (2013-01-25): This is just the wrong way to be doing this
+      uri = parseURI (encodeUri (last . T.words . remoteUri $ rest))
   in case uri of
     Nothing -> failure $ InvalidUrlException (T.unpack (remoteUri rest))
                                             "Invalid Nothing"
@@ -192,10 +212,12 @@ buildRequest :: Failure HttpException m =>
                 RESTfulRequest -> RESTfulEnvT m (Request m)
 buildRequest rest = do
   let reqi = request rest
-  uri <- getRequestUri rest
-  req <- parseUrl ((uriToString id uri) "")
+  uri  <- getRequestUri rest
+  req  <- parseUrl (uriToString id uri "")
   return req {
-      method             = method reqi
+      -- jww (2013-01-25): This is far too fragile!
+      method             = E.encodeUtf8 . head . T.words . remoteUri $ rest
+    , secure             = uriScheme uri == "https:"
     , clientCertificates = clientCertificates reqi
     , proxy              = proxy reqi
     , socksProxy         = socksProxy reqi
@@ -213,34 +235,27 @@ restfulMakeRequest :: RestfulInner m =>
                       RESTful () -> RESTfulEnvT m (ResumableSource m ByteString)
 restfulMakeRequest rest = do
   env <- ask
-  let env' = execState (restfulPrereq env >> rest) (def :: RESTfulRequest)
-  req <- buildRequest env'
-  responseBody <$> lift (http req (restfulManager env))
-
-restfulGetResponseBody :: RestfulInner m =>
-                          RESTful () -> RESTfulEnvT m (Maybe ByteString)
-restfulGetResponseBody rest = do
-  respBody <- restfulMakeRequest rest
-  lift $ respBody $$+- await
+  req <- buildRequest $ execState (restfulPrereq env >> rest) def
+  responseBody <$> lift (http (trace ("req: " ++ show req) req) (restfulManager env))
 
 applyAndDecode ::
     (RestfulInner m, TranslatableFrom b v) =>
-    Proxy v -> RESTfulEnvT m (Maybe ByteString) -> RESTfulEnvT m (Attempt b)
+    Proxy v -> RESTfulEnvT m (ResumableSource m ByteString)
+    -> RESTfulEnvT m (Attempt b)
 applyAndDecode x action = do
   content <- action
-  return $ case content of
-      Nothing -> Failure (TranslationException "Failed to decode value")
-      Just bs -> unwrap (BL.fromChunks [bs]) x
+  bs <- lift $ content $$+- consume
+  return . flip unwrap x . BL.fromChunks $ bs
 
 restfulGetAndDecode :: (RestfulInner m, TranslatableFrom b v) =>
                        Proxy v -> RESTful () -> RESTfulEnvT m (Attempt b)
-restfulGetAndDecode x = applyAndDecode x . restfulGetResponseBody
+restfulGetAndDecode x = applyAndDecode x . restfulMakeRequest
 
 restfulRawEx_ :: RestfulInner m =>
                  RequestBody Identity -> Text -> RESTful ()
-                 -> RESTfulEnvT m (Maybe ByteString)
+                 -> RESTfulEnvT m (ResumableSource m ByteString)
 restfulRawEx_ body url env =
-  restfulGetResponseBody $ do
+  restfulMakeRequest $ do
     let (meth,url') = T.span (==' ') url
     _request._method .= E.encodeUtf8 meth
     _request._body .= body
@@ -249,20 +264,21 @@ restfulRawEx_ body url env =
 
 restfulRawEx :: RestfulInner m =>
                 ByteString -> Text -> RESTful ()
-                -> RESTfulEnvT m (Maybe ByteString)
+                -> RESTfulEnvT m (ResumableSource m ByteString)
 restfulRawEx body = restfulRawEx_ (RequestBodyBS body)
 
 restfulRaw :: RestfulInner m =>
-              ByteString -> Text -> RESTfulEnvT m (Maybe ByteString)
+              ByteString -> Text -> RESTfulEnvT m (ResumableSource m ByteString)
 restfulRaw body url = restfulRawEx body url (return ())
 
 restfulRawExL :: RestfulInner m =>
                  BL.ByteString -> Text -> RESTful ()
-                 -> RESTfulEnvT m (Maybe ByteString)
+                 -> RESTfulEnvT m (ResumableSource m ByteString)
 restfulRawExL body = restfulRawEx_ (RequestBodyLBS body)
 
 restfulRawL :: RestfulInner m =>
-               BL.ByteString -> Text -> RESTfulEnvT m (Maybe ByteString)
+               BL.ByteString -> Text
+               -> RESTfulEnvT m (ResumableSource m ByteString)
 restfulRawL body url = restfulRawExL body url (return ())
 
 restfulEx :: (RestfulInner m, TranslatableTo a v, TranslatableFrom b v) =>
