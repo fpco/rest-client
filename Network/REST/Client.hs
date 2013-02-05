@@ -17,7 +17,7 @@ import           Control.Monad.Trans.Reader
 import           Control.Monad.Trans.State.Lazy
 import           Data.Aeson hiding ((.=), Success)
 import           Data.Attempt
-import           Data.ByteString as B ( ByteString )
+import           Data.ByteString as B ( ByteString, empty )
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as BL
 import           Data.CaseInsensitive
@@ -83,7 +83,14 @@ mergeRequests x y =
     , queryString = if queryString y == BC.empty
                     then queryString x
                     else queryString y
-    , requestBody = requestBody y
+    , requestBody =
+        let empty = case requestBody y of
+                RequestBodyLBS bs -> bs == BL.empty
+                RequestBodyBS bs -> bs == B.empty
+                _ -> False
+        in if empty
+           then requestBody x
+           else requestBody y
     , method = if method y == "GET"
                then method x
                else method y
@@ -232,11 +239,13 @@ type RestfulInner m =
   (Failure HttpException m, MonadResource m, MonadBaseControl IO m)
 
 restfulMakeRequest :: RestfulInner m =>
-                      RESTful () -> RESTfulEnvT m (ResumableSource m ByteString)
-restfulMakeRequest rest = do
+                      BL.ByteString -> RESTful ()
+                      -> RESTfulEnvT m (ResumableSource m ByteString)
+restfulMakeRequest body rest = do
   env <- ask
   req <- buildRequest $ execState (restfulPrereq env >> rest) def
-  responseBody <$> lift (http (trace ("req: " ++ show req) req) (restfulManager env))
+  responseBody <$> lift (http req { requestBody = RequestBodyLBS body }
+                         (restfulManager env))
 
 applyAndDecode ::
     (RestfulInner m, TranslatableFrom b v) =>
@@ -247,25 +256,24 @@ applyAndDecode x action = do
   bs <- lift $ content $$+- consume
   return . flip unwrap x . BL.fromChunks $ bs
 
-restfulGetAndDecode :: (RestfulInner m, TranslatableFrom b v) =>
-                       Proxy v -> RESTful () -> RESTfulEnvT m (Attempt b)
-restfulGetAndDecode x = applyAndDecode x . restfulMakeRequest
+-- restfulGetAndDecode :: (RestfulInner m, TranslatableFrom b v) =>
+--                        Proxy v -> RESTful () -> RESTfulEnvT m (Attempt b)
+-- restfulGetAndDecode x = applyAndDecode x . restfulMakeRequest BL.empty
 
 restfulRawEx_ :: RestfulInner m =>
-                 RequestBody Identity -> Text -> RESTful ()
+                 BL.ByteString -> Text -> RESTful ()
                  -> RESTfulEnvT m (ResumableSource m ByteString)
 restfulRawEx_ body url env =
-  restfulMakeRequest $ do
+  restfulMakeRequest body $ do
     let (meth,url') = T.span (==' ') url
     _request._method .= E.encodeUtf8 meth
-    _request._body .= body
     setUrl url'
     env
 
 restfulRawEx :: RestfulInner m =>
                 ByteString -> Text -> RESTful ()
                 -> RESTfulEnvT m (ResumableSource m ByteString)
-restfulRawEx body = restfulRawEx_ (RequestBodyBS body)
+restfulRawEx body = restfulRawEx_ (BL.fromChunks [body])
 
 restfulRaw :: RestfulInner m =>
               ByteString -> Text -> RESTfulEnvT m (ResumableSource m ByteString)
@@ -274,7 +282,7 @@ restfulRaw body url = restfulRawEx body url (return ())
 restfulRawExL :: RestfulInner m =>
                  BL.ByteString -> Text -> RESTful ()
                  -> RESTfulEnvT m (ResumableSource m ByteString)
-restfulRawExL body = restfulRawEx_ (RequestBodyLBS body)
+restfulRawExL body = restfulRawEx_ body
 
 restfulRawL :: RestfulInner m =>
                BL.ByteString -> Text
