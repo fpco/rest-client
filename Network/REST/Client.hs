@@ -42,23 +42,6 @@ import           Web.PathPieces
 type ContentType = ByteString
 type RequestId   = Request Identity
 
-instance Show (Request m) where
-    show x = "Request {"
-             ++ "\n  host                 = " ++ show (host x)
-             ++ "\n  port                 = " ++ show (port x)
-             ++ "\n  secure               = " ++ show (secure x)
-             ++ "\n  clientCertificates   = " ++ show (clientCertificates x)
-             ++ "\n  requestHeaders       = " ++ show (requestHeaders x)
-             ++ "\n  path                 = " ++ show (C.path x)
-             ++ "\n  queryString          = " ++ show (queryString x)
-             ++ "\n  requestBody          = " ++ show (requestBody x)
-             ++ "\n  method               = " ++ show (method x)
-             ++ "\n  proxy                = " ++ show (proxy x)
-             ++ "\n  rawBody              = " ++ show (rawBody x)
-             ++ "\n  redirectCount        = " ++ show (redirectCount x)
-             ++ "\n  responseTimeout      = " ++ show (responseTimeout x)
-             ++ "\n}"
-
 _method f req  = f (method req)         <&> \v -> req { method = v }
 _host f req    = f (host req)           <&> \v -> req { host = v }
 _port f req    = f (port req)           <&> \v -> req { port = v }
