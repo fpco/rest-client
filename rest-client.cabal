@@ -29,7 +29,6 @@ library
                      , conduit           >= 0.5
                      , containers        >= 0.4.2.1
                      , data-default      >= 0.5.0
-                     , data-marshal      >= 0.1
                      , failure           >= 0.2.0.1
                      , http-conduit      >= 1.8.5
                      , http-types        >= 0.7

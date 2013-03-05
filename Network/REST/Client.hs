@@ -1,6 +1,9 @@
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ViewPatterns #-}
@@ -9,6 +12,7 @@ module Network.REST.Client where
 
 import           Blaze.ByteString.Builder ( Builder, toByteString )
 import           Control.Applicative
+import           Control.Exception
 import           Control.Lens
 import           Control.Monad
 import           Control.Monad.IO.Class
@@ -26,12 +30,12 @@ import           Data.Conduit.List (consume)
 import           Data.Default ( Default(..) )
 import           Data.Functor.Identity
 import           Data.Map hiding ( null )
-import           Data.Marshal
 import           Data.Monoid
 import           Data.Proxy hiding (proxy)
 import           Data.Text ( Text, unpack, pack )
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as E
+import           Data.Typeable
 import           Debug.Trace
 import           Network.HTTP.Conduit as C hiding (Proxy)
 import           Network.HTTP.Types
@@ -227,8 +231,33 @@ restfulMakeRequest :: RestfulInner m =>
 restfulMakeRequest body rest = do
   env <- ask
   req <- buildRequest $ execState (restfulPrereq env >> rest) def
+  -- liftIO $ putStrLn $ "body: [" ++ show body ++ "]"
+  -- liftIO $ putStrLn $ "restfulMakeRequest: " ++ show (req { requestBody = RequestBodyLBS body })
   responseBody <$> lift (http req { requestBody = RequestBodyLBS body }
                          (restfulManager env))
+
+data TranslationException = TranslationException String
+                          deriving (Show, Typeable)
+
+instance Exception TranslationException
+
+class TranslatableTo a v where
+    wrap  :: a -> Proxy v -> BL.ByteString
+
+class TranslatableFrom a v where
+    unwrap :: BL.ByteString -> Proxy v -> Attempt a
+
+class (TranslatableTo a v, TranslatableFrom a v) => Translatable a v
+
+instance ToJSON a => TranslatableTo a Value where
+    wrap x _ = encode x
+
+instance FromJSON a => TranslatableFrom a Value where
+    unwrap str _ =
+        maybe (Failure (TranslationException
+                        $ "Cannot unwrap ByteString of "
+                        ++ show (BL.length str) ++ " bytes to JSON"))
+              Success (decode str)
 
 applyAndDecode ::
     (RestfulInner m, TranslatableFrom b v) =>
